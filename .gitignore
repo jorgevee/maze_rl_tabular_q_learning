@@ -1,0 +1,49 @@
+# Agent files
+.agents/
+.agents
+
+# Build output
+*.exe
+*.out
+*.o
+*.obj
+*.a
+*.so
+*.dll
+*.dylib
+
+# Debug symbols
+*.pdb
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+
+# Vim
+*.swp
+*.swo
+
+# VS Code
+.vscode/
+
+# Personal notes
+what_i_shouldve_learned.md
+plan.md 
+# CLion / JetBrains
+.idea/
+
+# Visual Studio
+.vs/
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+build/
+bin/
