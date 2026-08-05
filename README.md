@@ -59,5 +59,3 @@ Q(s,a) <- Q(s,a) + alpha * [reward + gamma * max Q(next state) - Q(s,a)]
 `alpha` controls how far the current estimate moves toward the new target. `gamma` controls how much future rewards matter. Only `qTable[state][action]` changes during an update.
 
 For a terminal goal transition, future Q-value is zero. The agent must not learn from imaginary actions after the episode has ended. An episode also stops after 200 steps so early random behavior cannot continue forever.
-
-More detailed learning notes are in [`what_i_shouldve_learned.md`](what_i_shouldve_learned.md), and the remaining roadmap is in [`plan.md`](plan.md).
