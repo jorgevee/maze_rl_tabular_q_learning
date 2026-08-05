@@ -5,6 +5,7 @@ int main(void)
 {
     InitWindow(800, 800, "Q-Learning Maze");
     InitializeAgent();
+    InitializeQTable();
     SetTargetFPS(60);
 
     //  Order matters: the maze is drawn first, then the red agent is drawn on top of it.
