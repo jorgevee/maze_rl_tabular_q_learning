@@ -21,7 +21,7 @@
   bool TryMove(Position *position, Action action);
   void InitializeAgent(void);
   void DrawAgent(Position position);
-  
+  void DrawValueHeatmap(void);
   /*
 Declare Q-table.
 For example:
@@ -38,6 +38,9 @@ Action GetBestAction(int state);
 // Epsilon-greedy selection
 Action ChooseAction(int state, float epsilon);
 // After seeing the reward and next state, how should the agent revise the value of the action it just took?
+
+// Declare drawing function
+void DrawPolicy(void);
 float GetMaximumQValue(int state);
 
   void UpdateQValue(
@@ -50,10 +53,17 @@ float GetMaximumQValue(int state);
       float gamma
 );
 
-// We return float because rewards are stored as floating-point values.
-float TrainEpisode(
+typedef struct {
+      int episode;
+      int steps;
+      float totalReward;
+      bool reachedGoal;
+  } EpisodeResult;
+EpisodeResult TrainEpisode(
+      int episodeNumber,
       float epsilon,
       float alpha,
       float gamma
   );
+
   #endif

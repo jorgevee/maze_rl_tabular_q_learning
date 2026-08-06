@@ -180,7 +180,222 @@ float GetMaximumQValue(int state)
       return maximum;
   }
 
-   void UpdateQValue(
+static bool GetPolicyAction(
+      int state,
+      Action *bestAction)
+  {
+      float firstValue = qTable[state][ACTION_UP];
+      float bestValue = firstValue;
+
+      *bestAction = ACTION_UP;
+
+      bool valuesDiffer = false;
+
+      for (int action = 1; action < ACTION_COUNT; action++)
+      {
+          float value = qTable[state][action];
+
+          if (value != firstValue)
+          {
+              valuesDiffer = true;
+          }
+
+          if (value > bestValue)
+          {
+              bestValue = value;
+              *bestAction = (Action)action;
+          }
+      }
+
+      // All equal means this state has no useful learned preference.
+      return valuesDiffer;
+  }
+void DrawPolicy(void)
+  {
+      static const float dx[ACTION_COUNT] = {
+          0.0f, 1.0f, 0.0f, -1.0f
+      };
+
+      static const float dy[ACTION_COUNT] = {
+          -1.0f, 0.0f, 1.0f, 0.0f
+      };
+
+      const Color arrowColor = PURPLE;
+
+      for (int y = 0; y < GRID_HEIGHT; y++)
+      {
+          for (int x = 0; x < GRID_WIDTH; x++)
+          {
+              if (maze[y][x] == CELL_WALL ||
+                  maze[y][x] == CELL_GOAL)
+              {
+                  continue;
+              }
+
+              Position position = { x, y };
+              int state = PositionToState(position);
+
+              Action action;
+
+              if (!GetPolicyAction(state, &action))
+              {
+                  continue;
+              }
+
+              Vector2 center = {
+                  MAZE_OFFSET_X + x * CELL_SIZE + CELL_SIZE / 2.0f,
+                  MAZE_OFFSET_Y + y * CELL_SIZE + CELL_SIZE / 2.0f
+              };
+
+              Vector2 direction = {
+                  dx[action],
+                  dy[action]
+              };
+
+              Vector2 tip = {
+                  center.x + direction.x * 20.0f,
+                  center.y + direction.y * 20.0f
+              };
+
+              Vector2 arrowBase = {
+                  tip.x - direction.x * 8.0f,
+                  tip.y - direction.y * 8.0f
+              };
+
+              Vector2 perpendicular = {
+                  -direction.y,
+                  direction.x
+              };
+
+              Vector2 left = {
+                  arrowBase.x + perpendicular.x * 6.0f,
+                  arrowBase.y + perpendicular.y * 6.0f
+              };
+
+              Vector2 right = {
+                  arrowBase.x - perpendicular.x * 6.0f,
+                  arrowBase.y - perpendicular.y * 6.0f
+              };
+
+              DrawLineEx(center, tip, 3.0f, arrowColor);
+              DrawLineEx(tip, left, 3.0f, arrowColor);
+              DrawLineEx(tip, right, 3.0f, arrowColor);
+          }
+      }
+  }
+
+/*
+The complete function has two passes:
+
+  Pass 1: Find minimum and maximum Q-values
+  Pass 2: Convert each value into a color
+
+  Normalization maps values into the range 0.0 through 1.0:
+
+  normalized = (value - minimum) / (maximum - minimum)
+
+*/
+void DrawValueHeatmap(void)
+  {
+      float minimumValue = 0.0f;
+      float maximumValue = 0.0f;
+      bool foundValue = false;
+
+      // Find the minimum and maximum state values.
+      for (int y = 0; y < GRID_HEIGHT; y++)
+      {
+          for (int x = 0; x < GRID_WIDTH; x++)
+          {
+              if (maze[y][x] == CELL_WALL ||
+                  maze[y][x] == CELL_GOAL)
+              {
+                  continue;
+              }
+
+              Position position = { x, y };
+              int state = PositionToState(position);
+              float value = GetMaximumQValue(state);
+
+              if (!foundValue)
+              {
+                  minimumValue = value;
+                  maximumValue = value;
+                  foundValue = true;
+              }
+              else
+              {
+                  if (value < minimumValue)
+                  {
+                      minimumValue = value;
+                  }
+
+                  if (value > maximumValue)
+                  {
+                      maximumValue = value;
+                  }
+              }
+          }
+      }
+
+      if (!foundValue || maximumValue <= minimumValue)
+      {
+          return;
+      }
+      for (int y = 0; y < GRID_HEIGHT; y++)
+      {
+          for (int x = 0; x < GRID_WIDTH; x++)
+          {
+              if (maze[y][x] == CELL_WALL ||
+                  maze[y][x] == CELL_GOAL)
+              {
+                  continue;
+              }
+
+              Position position = { x, y };
+              int state = PositionToState(position);
+
+              float value = GetMaximumQValue(state);
+
+              float normalized =
+                  (value - minimumValue) /
+                  (maximumValue - minimumValue);
+
+              unsigned char red =
+                  (unsigned char)(40.0f + 215.0f * normalized);
+
+              unsigned char green =
+                  (unsigned char)(80.0f + 120.0f * normalized);
+
+              unsigned char blue =
+                  (unsigned char)(220.0f - 180.0f * normalized);
+
+              Color heatColor = {
+                  red,
+                  green,
+                  blue,
+                  140
+              };
+
+              int screenX =
+                  MAZE_OFFSET_X + x * CELL_SIZE;
+
+              int screenY =
+                  MAZE_OFFSET_Y + y * CELL_SIZE;
+
+              DrawRectangle(
+                  screenX + 1,
+                  screenY + 1,
+                  CELL_SIZE - 2,
+                  CELL_SIZE - 2,
+                  heatColor
+              );
+          }
+      }
+  }
+
+
+
+void UpdateQValue(
       int state,
       Action action,
       float reward,
@@ -204,46 +419,52 @@ float GetMaximumQValue(int state)
       qTable[state][action] += alpha * error;
   }
 
-float TrainEpisode(
+EpisodeResult TrainEpisode(
+      int episodeNumber,
       float epsilon,
       float alpha,
       float gamma)
   {
+      EpisodeResult episodeResult = {
+          .episode = episodeNumber,
+          .steps = 0,
+          .totalReward = 0.0f,
+          .reachedGoal = false
+      };
+
       int state = PositionToState(startPosition);
-      float totalReward = 0.0f;
 
       for (int step = 0;
            step < MAX_STEPS_PER_EPISODE;
            step++)
       {
-          // 1. Select an action.
           Action action = ChooseAction(state, epsilon);
 
-          // 2. Apply the action to the environment.
-          StepResult result =
+          StepResult stepResult =
               EnvironmentStep(state, action);
 
-          // 3. Learn from the transition.
           UpdateQValue(
               state,
               action,
-              result.reward,
-              result.nextState,
-              result.done,
+              stepResult.reward,
+              stepResult.nextState,
+              stepResult.done,
               alpha,
               gamma
           );
 
-          // 4. Record the reward and advance the state.
-          totalReward += result.reward;
-          state = result.nextState;
+          episodeResult.totalReward += stepResult.reward;
+        //  step + 1 is important because the loop starts counting at zero, but one completed transition means one step.
+          episodeResult.steps = step + 1;
 
-          // 5. Stop if the goal was reached.
-          if (result.done)
+          state = stepResult.nextState;
+
+          if (stepResult.done)
           {
+              episodeResult.reachedGoal = true;
               break;
           }
       }
 
-      return totalReward;
+      return episodeResult;
   }
