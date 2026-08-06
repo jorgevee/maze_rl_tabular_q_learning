@@ -14,9 +14,11 @@ Implemented:
 - Greedy selection with random tie-breaking
 - Epsilon-greedy exploration
 - The Q-learning/Bellman update
-- A training-episode loop with a 200-step limit
+- Batched headless training with pause/resume and a 200-step episode limit
+- Epsilon decay from `1.0` to a minimum of `0.05`
+- A verified 5,000-episode run that learned the optimal 14-action route
 
-The next task is to connect `TrainEpisode()` to a key in `main.c`, run an episode, and then add repeated training and epsilon decay.
+Steps 1-15 in the project plan are complete. The next task is to track useful metrics such as success rate and average successful path length.
 
 ## Build and run
 
@@ -28,7 +30,27 @@ gcc -Wall -Wextra -pedantic src\main.c src\maze.c src\agent.c src\environment.c 
 .\main.exe
 ```
 
-Use the arrow keys to move the red agent. Walls block movement, the blue cell is the start, and the green cell is the goal.
+## Controls
+
+| Input | Action |
+| --- | --- |
+| Arrow keys | Move the red human-controlled agent |
+| `T` | Start or pause batched Q-learning training |
+
+Walls block movement, the blue cell is the start, and the green cell is the goal. Episode count, epsilon, and training status are displayed in the window.
+
+## Verified training result
+
+A 5,000-episode run completed successfully:
+
+| Episode | Sample reward | Epsilon |
+| ---: | ---: | ---: |
+| 100 | 2 | 0.606 |
+| 500 | 82 | 0.082 |
+| 1,000 | 87 | 0.050 |
+| 5,000 | 77 | 0.050 |
+
+The frequently observed reward of `87` represents an optimal 14-action route: 13 ordinary transitions at `-1`, followed by the `+100` goal transition. Occasional lower rewards are expected because the final policy retains 5% exploration.
 
 ## Source layout
 
