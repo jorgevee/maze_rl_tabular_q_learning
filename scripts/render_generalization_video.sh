@@ -4,7 +4,7 @@ set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 project_dir="$(cd "${script_dir}/.." && pwd)"
-output_path="${1:-${project_dir}/conv_learning.mp4}"
+output_path="${1:-${project_dir}/assets/conv_learning.mp4}"
 
 if [[ "${output_path}" != /* ]]; then
     output_path="$(pwd)/${output_path}"

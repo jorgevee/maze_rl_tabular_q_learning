@@ -40,7 +40,7 @@ generalization: $(TARGET)
 	./$(TARGET) --generalization --episodes 5000 --seeds 3 --seed 1 --csv generalization.csv
 
 video: $(TARGET)
-	./scripts/render_generalization_video.sh conv_learning.mp4
+	./scripts/render_generalization_video.sh assets/conv_learning.mp4
 
 clean:
 	rm -f $(TARGET) $(TEST_TARGET)

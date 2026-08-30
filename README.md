@@ -116,17 +116,17 @@ The MLP result is evidence of memorization. Convolution raised held-out success 
 
 ### Render the convolutional learning video
 
-<video src="./conv_learning.mp4" controls width="100%">
+<video src="./assets/conv_learning.mp4" controls width="100%">
   Your Markdown viewer does not support embedded video.
 </video>
 
-[Watch or download the convolutional learning video](./conv_learning.mp4)
+[Watch or download the convolutional learning video](./assets/conv_learning.mp4)
 
 On macOS or Linux with FFmpeg installed, create the deterministic annotated MP4
 with one command:
 
 ```sh
-./scripts/render_generalization_video.sh conv_learning.mp4
+./scripts/render_generalization_video.sh assets/conv_learning.mp4
 ```
 
 The exporter retrains learner seed 1, snapshots the convolutional policy at
