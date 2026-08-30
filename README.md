@@ -115,31 +115,8 @@ A 5,000-episode run with learner seeds 1 through 3 produced:
 The MLP result is evidence of memorization. Convolution raised held-out success from 3.7% to 22.2% while reducing parameter count from 22,084 to 13,624, showing that spatial weight sharing is a better inductive bias for this task. It still failed most held-out evaluations, especially larger mazes, so the next controlled experiment should keep the convolutional architecture fixed and broaden the procedural training distribution.
 
 ### Render the convolutional learning video
-[DQN Algo](https://github.com/jorgevee/maze_rl_tabular_q_learning/blob/main/assets/conv_learning.mp4)
 
-
-[Watch or download the convolutional learning video](./assets/conv_learning.mp4)
-
-On macOS or Linux with FFmpeg installed, create the deterministic annotated MP4
-with one command:
-
-```sh
-./scripts/render_generalization_video.sh assets/conv_learning.mp4
-```
-
-The exporter retrains learner seed 1, snapshots the convolutional policy at
-episodes 0, 100, 500, 1,000, 2,500, and 5,000, and replays the same fixed
-training, unseen 10 by 10, unseen 8 by 8, and unseen 12 by 12 mazes at every
-checkpoint. It renders 1280 by 720 PNG frames in a temporary directory, encodes
-a silent 45-second H.264 video, and removes the temporary frames afterward.
-
-For a custom or smoke render, invoke the frame renderer directly. The output
-directory must already exist:
-
-```sh
-./maze_rl --generalization-video --episodes 20 --seed 1 \
-  --frames /tmp/maze-video-frames --fps 2 --width 640 --height 360 --seconds 6
-```
+https://github.com/user-attachments/assets/d2289297-ace0-47bc-bece-839ec993c1c7
 
 ## Algorithms
 
