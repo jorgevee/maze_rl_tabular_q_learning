@@ -1,69 +1,20 @@
- #ifndef AGENT_H
- #define AGENT_H
+#ifndef AGENT_H
+#define AGENT_H
 
 #include <stdbool.h>
 #include "maze.h"
+#include "rl.h"
+#include "learner.h"
 
+extern Position startPosition;
+extern Position agentPosition;
+extern Position goalPosition;
 
-  typedef enum {
-      ACTION_UP,
-      ACTION_RIGHT,
-      ACTION_DOWN,
-      ACTION_LEFT,
-      ACTION_COUNT
-  } Action;
+void InitializeAgent(void);
+void ResetAgent(void);
+bool TryMove(Position *position, Action action);
+void DrawAgent(Position position);
+void DrawPolicy(const Learner *learner);
+void DrawValueHeatmap(const Learner *learner);
 
-  extern Position startPosition;
-  extern Position agentPosition;
-  extern Position goalPosition;
-
-  void ResetAgent(void);
-  bool TryMove(Position *position, Action action);
-  void InitializeAgent(void);
-  void DrawAgent(Position position);
-  void DrawValueHeatmap(void);
-  /*
-Declare Q-table.
-For example:
-
-qTable[11][ACTION_RIGHT]
-
-means:
-How valuable does the agent currently think moving right from state 11 is?
-*/
-extern float qTable[STATE_COUNT][ACTION_COUNT];
-void InitializeQTable(void);
-
-Action GetBestAction(int state);
-// Epsilon-greedy selection
-Action ChooseAction(int state, float epsilon);
-// After seeing the reward and next state, how should the agent revise the value of the action it just took?
-
-// Declare drawing function
-void DrawPolicy(void);
-float GetMaximumQValue(int state);
-
-  void UpdateQValue(
-      int state,
-      Action action,
-      float reward,
-      int nextState,
-      bool done,
-      float alpha,
-      float gamma
-);
-
-typedef struct {
-      int episode;
-      int steps;
-      float totalReward;
-      bool reachedGoal;
-  } EpisodeResult;
-EpisodeResult TrainEpisode(
-      int episodeNumber,
-      float epsilon,
-      float alpha,
-      float gamma
-  );
-
-  #endif
+#endif

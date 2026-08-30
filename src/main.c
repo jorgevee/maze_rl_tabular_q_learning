@@ -1,424 +1,155 @@
 #include "raylib.h"
 #include "maze.h"
 #include "agent.h"
+#include "benchmark.h"
+#include "dqn.h"
 #include "environment.h"
+#include "tabular.h"
+#include "trainer.h"
+#include <stdio.h>
 
-#define METRIC_WINDOW 100
+#define TRAINING_EPISODES 5000
 #define PREVIEW_MAX_STEPS 60
 
-typedef struct
-{
+typedef struct {
     bool active;
-    int checkpoint;
     int state;
     int steps;
     float timer;
 } PolicyPreview;
 
-static void StartPolicyPreview(
-    PolicyPreview *preview,
-    int checkpoint
-)
+static bool CreateLearners(Learner learners[AGENT_KIND_COUNT], Rng rngs[AGENT_KIND_COUNT])
 {
-    preview->active = true;
-    preview->checkpoint = checkpoint;
-    preview->state = PositionToState(startPosition);
-    preview->steps = 0;
-    preview->timer = 0.0f;
-
-    ResetAgent();
-
-    TraceLog(
-        LOG_INFO,
-        "Starting greedy preview at episode %d",
-        checkpoint
-    );
+    RngSeed(&rngs[AGENT_TABULAR], 1);
+    RngSeed(&rngs[AGENT_DQN], 2);
+    if (!CreateTabularLearner(&learners[AGENT_TABULAR], 0.1f, 0.95f)) return false;
+    if (!CreateDqnLearner(&learners[AGENT_DQN], DefaultDqnConfig(), &rngs[AGENT_DQN])) {
+        DestroyLearner(&learners[AGENT_TABULAR]);
+        return false;
+    }
+    return true;
 }
 
-int main(void)
+static void StartPreview(PolicyPreview *preview)
 {
-    InitWindow(800, 800, "Q-Learning Maze");
+    *preview = (PolicyPreview){
+        .active = true,
+        .state = PositionToState(startPosition)
+    };
+    ResetAgent();
+}
 
+int main(int argc, char **argv)
+{
     InitializeAgent();
-    InitializeQTable();
+    BenchmarkOptions benchmark;
+    if (argc > 1) {
+        if (!ParseBenchmarkOptions(argc, argv, &benchmark)) {
+            fprintf(stderr, "Usage: %s --benchmark [--agent both|tabular|dqn] [--episodes N] [--seeds N] [--seed N] [--csv FILE]\n", argv[0]);
+            return 2;
+        }
+        return RunBenchmark(&benchmark);
+    }
 
+    Learner learners[AGENT_KIND_COUNT] = {0};
+    Rng rngs[AGENT_KIND_COUNT];
+    if (!CreateLearners(learners, rngs)) {
+        fprintf(stderr, "Could not allocate learners.\n");
+        return 1;
+    }
+    TrainingStats stats[AGENT_KIND_COUNT];
+    InitializeTrainingStats(&stats[AGENT_TABULAR]);
+    InitializeTrainingStats(&stats[AGENT_DQN]);
+
+    InitWindow(800, 800, "Tabular Q-Learning vs DQN");
     SetTargetFPS(60);
-
-    // Hyperparameters for Q-learning
-    const float alpha = 0.1f;
-    const float gamma = 0.95f;
-
-    float epsilon = 1.0f;
-    const float epsilonMin = 0.05f;
-    const float epsilonDecay = 0.995f;
-
-    const int trainingEpisodes = 5000;
-    const int episodesPerFrame = 5;
-
-    int episodesTrained = 0;
+    AgentKind selected = AGENT_TABULAR;
     bool training = false;
-
-    // Metrics for recent performance
-    bool recentSuccesses[METRIC_WINDOW] = { false };
-    int recentSteps[METRIC_WINDOW] = { 0 };
-
-    int recentCount = 0;
-
-    float recentSuccessRate = 0.0f;
-    float recentAverageSteps = 0.0f;
-
-    EpisodeResult lastEpisode = { 0 };
-
+    bool humanMode = true;
     bool showPolicy = false;
     bool showValues = false;
+    int episodesPerFrame = 5;
+    PolicyPreview preview = {0};
 
-    // Preview checkpoints
-    const int previewCheckpoints[] =
-    {
-        0,
-        100,
-        500,
-        1000,
-        5000
-    };
+    while (!WindowShouldClose()) {
+        Learner *learner = &learners[selected];
+        TrainingStats *currentStats = &stats[selected];
+        Rng *rng = &rngs[selected];
 
-    const int previewCheckpointCount =
-        sizeof(previewCheckpoints) /
-        sizeof(previewCheckpoints[0]);
+        if (IsKeyPressed(KEY_A)) {
+            training = false;
+            preview.active = false;
+            selected = selected == AGENT_TABULAR ? AGENT_DQN : AGENT_TABULAR;
+            ResetAgent();
+            learner = &learners[selected];
+            currentStats = &stats[selected];
+            rng = &rngs[selected];
+        }
+        if (IsKeyPressed(KEY_H)) { humanMode = true; training = false; preview.active = false; }
+        if (IsKeyPressed(KEY_T) && currentStats->episodes < TRAINING_EPISODES) {
+            training = !training; humanMode = false; preview.active = false;
+        }
+        if (IsKeyPressed(KEY_D)) { training = false; humanMode = false; StartPreview(&preview); }
+        if (IsKeyPressed(KEY_R)) ResetAgent();
+        if (IsKeyPressed(KEY_C)) {
+            training = false; preview.active = false;
+            ResetLearner(learner, rng);
+            InitializeTrainingStats(currentStats);
+            ResetAgent();
+        }
+        if (IsKeyPressed(KEY_P)) showPolicy = !showPolicy;
+        if (IsKeyPressed(KEY_V)) showValues = !showValues;
+        if ((IsKeyPressed(KEY_EQUAL) || IsKeyPressed(KEY_KP_ADD)) && episodesPerFrame < 1000)
+            episodesPerFrame *= 2;
+        if ((IsKeyPressed(KEY_MINUS) || IsKeyPressed(KEY_KP_SUBTRACT)) && episodesPerFrame > 1)
+            episodesPerFrame = episodesPerFrame > 2 ? episodesPerFrame / 2 : 1;
 
-    int nextPreviewIndex = 0;
+        if (humanMode && !training && !preview.active) {
+            if (IsKeyPressed(KEY_UP)) TryMove(&agentPosition, ACTION_UP);
+            else if (IsKeyPressed(KEY_RIGHT)) TryMove(&agentPosition, ACTION_RIGHT);
+            else if (IsKeyPressed(KEY_DOWN)) TryMove(&agentPosition, ACTION_DOWN);
+            else if (IsKeyPressed(KEY_LEFT)) TryMove(&agentPosition, ACTION_LEFT);
+        }
 
-    PolicyPreview preview = { 0 };
+        if (training) {
+            for (int episode = 0; episode < episodesPerFrame && currentStats->episodes < TRAINING_EPISODES; episode++)
+                TrainAndRecordEpisode(learner, currentStats, rng);
+            if (currentStats->episodes >= TRAINING_EPISODES) training = false;
+        }
 
-    const float previewStepDelay = 0.10f;
-
-    // Main window loop
-    while (!WindowShouldClose())
-    {
-        // Manual movement
-        if (!training && !preview.active)
-  {
-      if (IsKeyPressed(KEY_UP))
-      {
-          TryMove(&agentPosition, ACTION_UP);
-      }
-      else if (IsKeyPressed(KEY_RIGHT))
-      {
-          TryMove(&agentPosition, ACTION_RIGHT);
-      }
-      else if (IsKeyPressed(KEY_DOWN))
-      {
-          TryMove(&agentPosition, ACTION_DOWN);
-      }
-      else if (IsKeyPressed(KEY_LEFT))
-      {
-          TryMove(&agentPosition, ACTION_LEFT);
-      }
-  }
-
-        // Toggle training
-        if (IsKeyPressed(KEY_T))
-        {
-            training = !training;
-
-            if (!training)
-            {
-                preview.active = false;
+        if (preview.active) {
+            preview.timer += GetFrameTime();
+            if (preview.timer >= 0.10f) {
+                preview.timer = 0.0f;
+                Action action = LearnerSelectAction(learner, preview.state, 0.0f, rng);
+                StepResult result = EnvironmentStep(preview.state, action);
+                preview.state = result.nextState;
+                agentPosition = StateToPosition(preview.state);
+                preview.steps++;
+                if (result.done || preview.steps >= PREVIEW_MAX_STEPS) preview.active = false;
             }
         }
 
-        if (IsKeyPressed(KEY_P))
-        {
-            showPolicy = !showPolicy;
-        }
-
-        if (IsKeyPressed(KEY_V))
-        {
-            showValues = !showValues;
-        }
-
-        // Start preview at configured checkpoints
-        if (
-            training &&
-            !preview.active &&
-            nextPreviewIndex < previewCheckpointCount &&
-            episodesTrained >=
-                previewCheckpoints[nextPreviewIndex]
-        )
-        {
-            StartPolicyPreview(
-                &preview,
-                previewCheckpoints[nextPreviewIndex]
-            );
-
-            nextPreviewIndex++;
-        }
-
-        // Train Q-learning episodes
-        if (training && !preview.active)
-        {
-            for (
-                int episode = 0;
-                episode < episodesPerFrame &&
-                episodesTrained < trainingEpisodes;
-                episode++
-            )
-            {
-                lastEpisode = TrainEpisode(
-                    episodesTrained + 1,
-                    epsilon,
-                    alpha,
-                    gamma
-                );
-
-                epsilon *= epsilonDecay;
-
-                if (epsilon < epsilonMin)
-                {
-                    epsilon = epsilonMin;
-                }
-
-                int metricIndex =
-                    episodesTrained % METRIC_WINDOW;
-
-                recentSuccesses[metricIndex] =
-                    lastEpisode.reachedGoal;
-
-                recentSteps[metricIndex] =
-                    lastEpisode.steps;
-
-                if (recentCount < METRIC_WINDOW)
-                {
-                    recentCount++;
-                }
-
-                episodesTrained++;
-
-                int successCount = 0;
-                int successfulStepTotal = 0;
-
-                for (
-                    int index = 0;
-                    index < recentCount;
-                    index++
-                )
-                {
-                    if (recentSuccesses[index])
-                    {
-                        successCount++;
-                        successfulStepTotal +=
-                            recentSteps[index];
-                    }
-                }
-
-                if (recentCount > 0)
-                {
-                    recentSuccessRate =
-                        100.0f *
-                        successCount /
-                        recentCount;
-                }
-
-                if (successCount > 0)
-                {
-                    recentAverageSteps =
-                        (float)successfulStepTotal /
-                        successCount;
-                }
-                else
-                {
-                    recentAverageSteps = 0.0f;
-                }
-
-                if (episodesTrained % 100 == 0)
-                {
-                    TraceLog(
-                        LOG_INFO,
-                        "Episode: %d | Reward: %.1f | Success Rate: %.2f%% | Avg Steps: %.2f | Epsilon: %.3f",
-                        episodesTrained,
-                        lastEpisode.totalReward,
-                        recentSuccessRate,
-                        recentAverageSteps,
-                        epsilon
-                    );
-                }
-            }
-
-            if (episodesTrained >= trainingEpisodes)
-            {
-                training = false;
-
-                TraceLog(
-                    LOG_INFO,
-                    "Training complete after %d episodes",
-                    episodesTrained
-                );
-            }
-
-            if (
-                !preview.active &&
-                nextPreviewIndex < previewCheckpointCount &&
-                episodesTrained >=
-                    previewCheckpoints[nextPreviewIndex]
-            )
-            {
-                StartPolicyPreview(
-                    &preview,
-                    previewCheckpoints[nextPreviewIndex]
-                );
-
-                nextPreviewIndex++;
-            }
-        }
-        if (preview.active)
-  {
-      preview.timer += GetFrameTime();
-
-      if (preview.timer >= previewStepDelay)
-      {
-          preview.timer = 0.0f;
-
-          Action action =
-              ChooseAction(preview.state, 0.0f);
-
-          StepResult result =
-              EnvironmentStep(
-                  preview.state,
-                  action
-              );
-
-          preview.state = result.nextState;
-
-          agentPosition =
-              StateToPosition(preview.state);
-
-          preview.steps++;
-
-          if (result.done)
-          {
-              TraceLog(
-                  LOG_INFO,
-                  "Preview %d reached goal in %d steps",
-                  preview.checkpoint,
-                  preview.steps
-              );
-
-              preview.active = false;
-          }
-          else if (
-              preview.steps >= PREVIEW_MAX_STEPS
-          )
-          {
-              TraceLog(
-                  LOG_INFO,
-                  "Preview %d stopped after %d steps",
-                  preview.checkpoint,
-                  preview.steps
-              );
-
-              preview.active = false;
-          }
-      }
-  }
-
-        const char *statusText;
-        Color statusColor;
-
-        if (preview.active)
-        {
-            statusText = TextFormat(
-                "Preview: %d (eps=0)",
-                preview.checkpoint
-            );
-
-            statusColor = PURPLE;
-        }
-        else if (training)
-        {
-            statusText = "Training: RUNNING";
-            statusColor = RED;
-        }
-        else
-        {
-            statusText = "Training: PAUSED";
-            statusColor = DARKGRAY;
-        }
-
+        const char *mode = preview.active ? "GREEDY DEMO (eps=0)" :
+            training ? "TRAINING" : humanMode ? "HUMAN" : "PAUSED";
         BeginDrawing();
         ClearBackground(RAYWHITE);
-
-        DrawText(
-            "Maze RL",
-            20,
-            20,
-            30,
-            BLACK
-        );
-
+        DrawText(TextFormat("Agent: %s | Mode: %s", AgentKindName(selected), mode), 20, 8, 18, BLACK);
+        DrawText(TextFormat("Episodes: %d/%d  eps: %.3f  speed: %d/frame",
+            currentStats->episodes, TRAINING_EPISODES, currentStats->epsilon, episodesPerFrame), 20, 30, 17, DARKGRAY);
+        DrawText(TextFormat("Last 100: %.0f%% success  %.2f avg successful steps",
+            currentStats->successRate, currentStats->averageSuccessfulSteps), 400, 52, 15, DARKGRAY);
         DrawMaze();
-
-        if (showValues)
-        {
-            DrawValueHeatmap();
-        }
-
-        if (showPolicy)
-        {
-            DrawPolicy();
-        }
-
+        if (showValues) DrawValueHeatmap(learner);
+        if (showPolicy) DrawPolicy(learner);
         DrawAgent(agentPosition);
-
-        // Display current state
-        int currentState =
-            PositionToState(agentPosition);
-
-        DrawText(
-            TextFormat(
-                "Current State: %d",
-                currentState
-            ),
-            200,
-            10,
-            18,
-            BLACK
-        );
-
-        DrawText(
-            TextFormat(
-                "Epsilon: %.3f",
-                epsilon
-            ),
-            200,
-            35,
-            18,
-            BLACK
-        );
-
-        DrawText(
-            TextFormat(
-                "Episodes: %d / %d",
-                episodesTrained,
-                trainingEpisodes
-            ),
-            430,
-            10,
-            18,
-            BLACK
-        );
-
-        DrawText(
-            statusText,
-            430,
-            35,
-            18,
-            statusColor
-        );
-
+        DrawText("A agent  H human  T train  D demo  C clear  R reset  P policy  V values  +/- speed",
+            18, 778, 13, BLACK);
         EndDrawing();
     }
 
+    DestroyLearner(&learners[AGENT_TABULAR]);
+    DestroyLearner(&learners[AGENT_DQN]);
     CloseWindow();
-
     return 0;
 }

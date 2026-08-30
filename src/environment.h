@@ -3,7 +3,7 @@
 #define ENVIRONMENT_H
 
 #include <stdbool.h>
-#include "agent.h"
+#include "rl.h"
 
 #define MAX_STEPS_PER_EPISODE 200
 

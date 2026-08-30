@@ -1,0 +1,236 @@
+digraph DQNAlgorithm {
+    graph [
+        rankdir=TB,
+        bgcolor="#fbfbfd",
+        pad="0.35",
+        nodesep="0.35",
+        ranksep="0.48",
+        fontname="Segoe UI",
+        fontsize=18,
+        label="DQN Training Flow for the Maze",
+        labelloc=t,
+        labeljust=c,
+        splines=ortho
+    ];
+
+    node [
+        shape=box,
+        style="rounded,filled",
+        fillcolor="#ffffff",
+        color="#475569",
+        fontcolor="#0f172a",
+        fontname="Segoe UI",
+        fontsize=11,
+        margin="0.16,0.10"
+    ];
+
+    edge [
+        color="#64748b",
+        fontcolor="#334155",
+        fontname="Segoe UI",
+        fontsize=10,
+        arrowsize=0.75
+    ];
+
+    initialize [
+        shape=oval,
+        fillcolor="#dbeafe",
+        color="#2563eb",
+        label="Initialize training\nOnline network: random He weights\nTarget network: copy online network\nReplay buffer: empty"
+    ];
+
+    reset_episode [
+        fillcolor="#eff6ff",
+        color="#3b82f6",
+        label="Reset episode\nstate = maze start\nsteps = 0"
+    ];
+
+    select_mode [
+        shape=diamond,
+        fillcolor="#fef3c7",
+        color="#d97706",
+        label="random() < epsilon?"
+    ];
+
+    random_action [
+        fillcolor="#fffbeb",
+        color="#f59e0b",
+        label="Explore\nChoose any of 4 actions"
+    ];
+
+    online_action [
+        fillcolor="#ede9fe",
+        color="#7c3aed",
+        label="Exploit\nOne-hot state -> online network\nChoose argmax Q(state, action)\nRandomly break exact ties"
+    ];
+
+    environment [
+        fillcolor="#dcfce7",
+        color="#16a34a",
+        label="EnvironmentStep(state, action)\nReturns nextState, reward, done"
+    ];
+
+    transition [
+        shape=note,
+        fillcolor="#f0fdf4",
+        color="#22c55e",
+        label="Transition\n(state, action, reward, nextState, done)"
+    ];
+
+    replay [
+        shape=cylinder,
+        fillcolor="#e0f2fe",
+        color="#0284c7",
+        label="Store in circular replay buffer\nCapacity: 10,000 transitions"
+    ];
+
+    warm [
+        shape=diamond,
+        fillcolor="#fef3c7",
+        color="#d97706",
+        label="At least 500\ntransitions stored?"
+    ];
+
+    sample [
+        shape=cylinder,
+        fillcolor="#e0f2fe",
+        color="#0284c7",
+        label="Sample random minibatch\n32 transitions"
+    ];
+
+    prediction [
+        fillcolor="#ede9fe",
+        color="#7c3aed",
+        label="Online prediction\nQonline(state, chosen action)"
+    ];
+
+    terminal [
+        shape=diamond,
+        fillcolor="#fef3c7",
+        color="#d97706",
+        label="Transition done?"
+    ];
+
+    terminal_target [
+        fillcolor="#fce7f3",
+        color="#db2777",
+        label="Terminal target\ntarget = reward"
+    ];
+
+    future_target [
+        fillcolor="#fce7f3",
+        color="#db2777",
+        label="Bootstrapped target\ntarget = reward + 0.95 *\nmax Qtarget(nextState, action)"
+    ];
+
+    loss [
+        fillcolor="#fee2e2",
+        color="#dc2626",
+        label="Huber loss\nerror = prediction - target"
+    ];
+
+    optimize [
+        fillcolor="#fee2e2",
+        color="#dc2626",
+        label="Backpropagate minibatch\nClip gradient norm to 10\nAdam update, learning rate 0.001"
+    ];
+
+    sync_check [
+        shape=diamond,
+        fillcolor="#fef3c7",
+        color="#d97706",
+        label="250 optimizer updates\nsince target copy?"
+    ];
+
+    sync [
+        fillcolor="#ede9fe",
+        color="#7c3aed",
+        label="Hard target update\nTarget network = online network"
+    ];
+
+    episode_end [
+        shape=diamond,
+        fillcolor="#fef3c7",
+        color="#d97706",
+        label="Goal reached or\n200 steps used?"
+    ];
+
+    continue_step [
+        fillcolor="#eff6ff",
+        color="#3b82f6",
+        label="state = nextState\nsteps += 1"
+    ];
+
+    record [
+        fillcolor="#ecfccb",
+        color="#65a30d",
+        label="Record episode metrics\nDecay epsilon by 0.995\nMinimum epsilon = 0.05"
+    ];
+
+    finished [
+        shape=diamond,
+        fillcolor="#fef3c7",
+        color="#d97706",
+        label="5,000 episodes\ncompleted?"
+    ];
+
+    stop [
+        shape=oval,
+        fillcolor="#dbeafe",
+        color="#2563eb",
+        label="Training complete"
+    ];
+
+    evaluation [
+        shape=component,
+        fillcolor="#f1f5f9",
+        color="#475569",
+        label="Frozen greedy evaluation every 100 episodes\nepsilon = 0, separate RNG, no replay writes,\nno optimizer updates, no epsilon decay"
+    ];
+
+    initialize -> reset_episode;
+    reset_episode -> select_mode;
+    select_mode -> random_action [label="yes"];
+    select_mode -> online_action [label="no"];
+    random_action -> environment;
+    online_action -> environment;
+    environment -> transition;
+    transition -> replay;
+    replay -> warm;
+
+    warm -> sample [label="yes"];
+    sample -> prediction;
+    prediction -> terminal;
+    terminal -> terminal_target [label="yes"];
+    terminal -> future_target [label="no"];
+    terminal_target -> loss;
+    future_target -> loss;
+    loss -> optimize;
+    optimize -> sync_check;
+    sync_check -> sync [label="yes"];
+    sync -> episode_end;
+    sync_check -> episode_end [label="no"];
+    warm -> episode_end [label="no"];
+
+    episode_end -> continue_step [label="no"];
+    continue_step -> select_mode;
+    episode_end -> record [label="yes"];
+    record -> evaluation [style=dashed, label="checkpoint"];
+    record -> finished;
+    finished -> reset_episode [label="no"];
+    finished -> stop [label="yes"];
+
+    evaluation -> finished [style=dashed, constraint=false];
+
+    subgraph cluster_network {
+        label="Shared DQN architecture";
+        color="#c4b5fd";
+        style="rounded,dashed";
+        fontname="Segoe UI";
+        fontsize=11;
+        network_note [
+            shape=plaintext,
+            label="100-state one-hot input  ->  64 ReLU units  ->  4 action values\n6,724 trainable parameters"
+        ];
+    }
+}
