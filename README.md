@@ -115,10 +115,8 @@ A 5,000-episode run with learner seeds 1 through 3 produced:
 The MLP result is evidence of memorization. Convolution raised held-out success from 3.7% to 22.2% while reducing parameter count from 22,084 to 13,624, showing that spatial weight sharing is a better inductive bias for this task. It still failed most held-out evaluations, especially larger mazes, so the next controlled experiment should keep the convolutional architecture fixed and broaden the procedural training distribution.
 
 ### Render the convolutional learning video
+[DQN Algo](https://github.com/jorgevee/maze_rl_tabular_q_learning/blob/main/assets/conv_learning.mp4)
 
-<video src="./assets/conv_learning.mp4" controls width="100%">
-  Your Markdown viewer does not support embedded video.
-</video>
 
 [Watch or download the convolutional learning video](./assets/conv_learning.mp4)
 
