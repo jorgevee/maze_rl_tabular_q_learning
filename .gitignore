@@ -11,6 +11,13 @@
 *.so
 *.dll
 *.dylib
+/maze_rl
+/test_rl
+
+# Disposable video-render output
+/video_frames/
+/frame_*.png
+/manifest.txt
 
 # Debug symbols
 *.pdb
@@ -30,8 +37,10 @@
 .vscode/
 
 # Personal notes
-# what_i_shouldve_learned.md
+what_i_shouldve_learned.md
 plan.md 
+EXPERIMENTS.md
+generalization.csv
 # CLion / JetBrains
 .idea/
 

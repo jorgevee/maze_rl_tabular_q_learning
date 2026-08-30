@@ -4,6 +4,7 @@
 #include <stdbool.h>
 
 int RunGeneralizationExperiment(int argc, char **argv);
+int RunGeneralizationVideo(int argc, char **argv);
 bool GeneralizationRunSelfTests(void);
 
 #endif

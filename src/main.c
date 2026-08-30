@@ -46,6 +46,8 @@ int main(int argc, char **argv)
     InitializeAgent();
     if (argc > 1 && strcmp(argv[1], "--generalization") == 0)
         return RunGeneralizationExperiment(argc, argv);
+    if (argc > 1 && strcmp(argv[1], "--generalization-video") == 0)
+        return RunGeneralizationVideo(argc, argv);
     BenchmarkOptions benchmark;
     if (argc > 1) {
         if (!ParseBenchmarkOptions(argc, argv, &benchmark)) {

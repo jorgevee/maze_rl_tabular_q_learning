@@ -73,10 +73,11 @@ Both agents had solved the maze by the first 100-episode evaluation checkpoint i
 
 ## Held-out maze generalization experiment
 
-The single-maze DQN cannot genuinely generalize because its one-hot input contains only the agent's position. The same position in two different mazes produces the same observation even when walls require different actions. A separate headless experiment tests that limitation and a more informative observation:
+The single-maze DQN cannot genuinely generalize because its one-hot input contains only the agent's position. The same position in two different mazes produces the same observation even when walls require different actions. A separate headless experiment tests that limitation, a more informative observation, and an architecture with spatial weight sharing:
 
 - **Position-only baseline:** a 144-element one-hot position in a padded 12 by 12 space.
-- **Layout-aware DQN:** a 13 by 13 agent-centered crop with wall and goal channels, plus normalized goal displacement. This produces 340 inputs and works with every tested size up to 12 by 12.
+- **Layout-aware MLP:** a 13 by 13 agent-centered crop with wall and goal channels, plus normalized goal displacement. This produces 340 inputs and works with every tested size up to 12 by 12.
+- **Convolutional DQN:** the same layout observation processed by two shared 3 by 3 convolution stages and a 64-unit Q-value head.
 
 The deterministic suite contains:
 
@@ -101,16 +102,46 @@ make generalization
 
 The CSV includes the reproducible maze-generation seed, split, dimensions, BFS-optimal steps, success, actual steps, optimality gap, return, training time, and model size.
 
-### Initial result and interpretation
+### Three-seed result and interpretation
 
-A 5,000-episode run with learner seed 1 produced:
+A 5,000-episode run with learner seeds 1 through 3 produced:
 
-| Observation | Training 10 by 10 | Unseen 10 by 10 | Unseen 8 by 8 | Unseen 12 by 12 |
-| --- | ---: | ---: | ---: | ---: |
-| Position only | 0 / 16 | 0 / 6 | 0 / 6 | 0 / 6 |
-| Layout aware | 16 / 16 | 0 / 6 | 1 / 6 | 0 / 6 |
+| Observation | Training 10 by 10 | Unseen 10 by 10 | Unseen 8 by 8 | Unseen 12 by 12 | All unseen |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Position only | 0 / 48 | 0 / 18 | 0 / 18 | 0 / 18 | 0 / 54 |
+| Layout-aware MLP | 48 / 48 | 1 / 18 | 1 / 18 | 0 / 18 | 2 / 54 |
+| Convolutional | 48 / 48 | 5 / 18 | 6 / 18 | 1 / 18 | 12 / 54 |
 
-This is evidence of memorization, not generalization. The layout-aware MLP had enough information to distinguish and learn every training maze, but it did not reliably transfer that behavior to unseen layouts. More training on the same 16 maps would not by itself establish generalization. The next architectural hypothesis should introduce spatial weight sharing, such as a convolutional network, and train on a much broader procedural maze distribution.
+The MLP result is evidence of memorization. Convolution raised held-out success from 3.7% to 22.2% while reducing parameter count from 22,084 to 13,624, showing that spatial weight sharing is a better inductive bias for this task. It still failed most held-out evaluations, especially larger mazes, so the next controlled experiment should keep the convolutional architecture fixed and broaden the procedural training distribution.
+
+### Render the convolutional learning video
+
+<video src="./conv_learning.mp4" controls width="100%">
+  Your Markdown viewer does not support embedded video.
+</video>
+
+[Watch or download the convolutional learning video](./conv_learning.mp4)
+
+On macOS or Linux with FFmpeg installed, create the deterministic annotated MP4
+with one command:
+
+```sh
+./scripts/render_generalization_video.sh conv_learning.mp4
+```
+
+The exporter retrains learner seed 1, snapshots the convolutional policy at
+episodes 0, 100, 500, 1,000, 2,500, and 5,000, and replays the same fixed
+training, unseen 10 by 10, unseen 8 by 8, and unseen 12 by 12 mazes at every
+checkpoint. It renders 1280 by 720 PNG frames in a temporary directory, encodes
+a silent 45-second H.264 video, and removes the temporary frames afterward.
+
+For a custom or smoke render, invoke the frame renderer directly. The output
+directory must already exist:
+
+```sh
+./maze_rl --generalization-video --episodes 20 --seed 1 \
+  --frames /tmp/maze-video-frames --fps 2 --width 640 --height 360 --seconds 6
+```
 
 ## Algorithms
 
@@ -149,7 +180,7 @@ One-hot input makes the baseline honest: it gives DQN the same state identity us
 
 ## Summary of mathematical formalisms
 
-Let \(s_t\) be the current state, \(a_t \in \mathcal{A}\) one of the four actions, \(\theta\) the online-network parameters, and \(\theta^-\) the target-network parameters.
+Let $s_t$ be the current state, $a_t \in \mathcal{A}$ one of the four actions, $\theta$ the online-network parameters, and $\theta^-$ the target-network parameters.
 
 ### Epsilon-greedy action selection
 
@@ -178,7 +209,7 @@ $$
 
 ### Bellman optimality target
 
-For replay transition \(j\), let \(d_j=1\) indicate termination. The fixed target-network value is:
+For replay transition $j$, let $d_j=1$ indicate termination. The fixed target-network value is:
 
 $$
 y_j =
@@ -194,13 +225,13 @@ The terminal branch deliberately contains no future value because no action occu
 
 ### Minibatch Huber loss
 
-For a uniformly sampled replay minibatch \(B\), define the temporal-difference error:
+For a uniformly sampled replay minibatch $B$, define the temporal-difference error:
 
 $$
 e_j = y_j - Q(s_j,a_j;\theta).
 $$
 
-The implementation uses Huber loss with threshold \(1\):
+The implementation uses Huber loss with threshold $1$:
 
 $$
 \mathrm{Huber}_1(e) =
@@ -218,7 +249,7 @@ $$
 
 ### Gradient clipping and optimization
 
-The minibatch gradient is clipped to Euclidean norm \(10\), then passed to Adam:
+The minibatch gradient is clipped to Euclidean norm $10$, then passed to Adam:
 
 $$
 g = \nabla_\theta L(\theta),
@@ -258,11 +289,11 @@ $$
 \epsilon_{\min}=0.05,
 $$
 
-starting from \(\epsilon_0=1.0\).
+starting from $\epsilon_0=1.0$.
 
 ### Network equations and tensor dimensions
 
-For one-hot state vector \(x(s)\in\mathbb{R}^{100}\):
+For one-hot state vector $x(s)\in\mathbb{R}^{100}$:
 
 $$
 h = \mathrm{ReLU}(W_1x(s)+b_1),
@@ -279,13 +310,27 @@ W_2\in\mathbb{R}^{4\times64},\quad
 b_2\in\mathbb{R}^{4}.
 $$
 
-Therefore the online network contains exactly:
+Therefore the online network contains exactly
 
 $$
-(64\times100)+64+(4\times64)+4=6{,}724
+(64\times100)+64+(4\times64)+4
+=6{,}724.
 $$
 
-trainable parameters. Weights use He initialization, \(W_{ij}\sim\mathcal{N}(0,2/n_{\mathrm{in}})\), before the target network is initialized as a copy of the online network.
+Thus, the online network has **6,724 trainable parameters**.
+
+Weights use He initialization with variance $2/n_{\mathrm{in}}$:
+
+$$
+W_{ij} \sim \mathcal{N}\!\left(0,\frac{2}{n_{\mathrm{in}}}\right).
+$$
+
+After the online weights are initialized, the target network begins as an exact
+copy of the online network:
+
+$$
+\theta^- \leftarrow \theta.
+$$
 
 ## Tests
 

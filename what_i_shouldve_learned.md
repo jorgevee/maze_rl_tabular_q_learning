@@ -255,6 +255,59 @@ Both agents were solved by the first 100-episode checkpoint in all ten seeds. Be
 
 The lesson is not that DQN is bad. The lesson is to match the representation to the problem. On a tiny, fixed, discrete state space, tabular Q-learning is simpler, faster, smaller, easier to inspect, and stable. DQN becomes attractive when a table is impractical or when useful structure can be shared across a much larger state space.
 
+## What the held-out maze experiments showed
+
+Generalization requires both a sufficient observation and an architecture that
+can reuse its structure. The controlled experiment trained on 16 fixed 10 by 10
+mazes and evaluated frozen greedy policies on six unseen 10 by 10, six unseen 8
+by 8, and six unseen 12 by 12 mazes. Three learner seeds produced these results:
+
+| Observation and architecture | Train 10 by 10 | Unseen 10 by 10 | Unseen 8 by 8 | Unseen 12 by 12 | All unseen |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Position-only MLP | 0 / 48 | 0 / 18 | 0 / 18 | 0 / 18 | 0 / 54 |
+| Layout-aware MLP | 48 / 48 | 1 / 18 | 1 / 18 | 0 / 18 | 2 / 54 |
+| Layout-aware convolutional DQN | 48 / 48 | 5 / 18 | 6 / 18 | 1 / 18 | 12 / 54 |
+
+The position-only result demonstrates observation aliasing. Coordinates such as
+`(3, 4)` do not identify the correct action when different mazes place different
+walls around that coordinate. No network can infer missing layout information
+from the coordinate alone.
+
+The flattened layout-aware MLP receives enough information to distinguish the
+mazes, but each first-layer weight is tied to one absolute crop location. It
+learned optimal policies for all training mazes and transferred on only 3.7% of
+held-out evaluations. Access to the layout was necessary but not sufficient.
+
+The convolutional model processes the same observation as spatial planes:
+
+```text
+2 x 13 x 13 wall and goal planes
+    -> 4 shared 3 x 3 filters, stride 1
+    -> 8 shared 3 x 3 filters, stride 2
+    -> 8 x 5 x 5 features plus goal displacement
+    -> 64 hidden units
+    -> 4 Q-values
+```
+
+Sharing a filter across crop locations lets a local pattern learned in one place
+be recognized elsewhere. Held-out success increased from `2 / 54` to `12 / 54`
+while parameter count fell from `22,084` to `13,624`. All three seeds improved
+over their corresponding MLP, and eight of the 12 transferred solutions were
+BFS-optimal. The mean successful path was only `0.67` steps above optimum.
+
+This is evidence that the inductive bias helped, not evidence that generalization
+is solved. The 54 evaluations reuse the same 18 held-out layouts across three
+learner seeds, only 22.2% succeeded, and just one of 18 larger-maze evaluations
+succeeded. Two local convolution stages can recognize patterns, but they do not
+explicitly perform the long-range search or value propagation needed for reliable
+maze planning.
+
+The experiment also illustrates why controlled changes matter. Keeping the maze
+suite and training budget fixed made it possible to attribute the improvement to
+the architecture. The next experiment should keep the convolutional model and
+held-out suite fixed while increasing only the breadth of the procedural training
+distribution.
+
 ## Reproducibility is part of correctness
 
 The original learner used raylib randomness. That was convenient for visualization, but coupled learning to the graphics library and made headless experiments harder to reproduce.
@@ -278,15 +331,17 @@ End-to-end success alone is insufficient because a small maze may occasionally b
 - target-network copying
 - parameter counts
 - same-seed determinism
-- a finite-difference gradient check
+- finite-difference gradient checks for both dense and convolutional backpropagation
 - both learners reaching the known 14-step optimum
 
 The finite-difference check perturbs one weight, measures the numerical change in loss, and compares that slope with the analytic backpropagation gradient. This is particularly valuable when implementing neural-network math manually.
 
 ## Concerns and limitations
 
-- This is one fixed deterministic maze. It does not demonstrate DQN generalization.
-- One-hot states let the network memorize state identities; a new-maze experiment needs inputs that describe maze structure.
+- The interactive benchmark still uses one fixed deterministic maze; only the separate headless experiment measures held-out generalization.
+- One-hot states cannot represent changing wall layouts. The generalization models require explicit wall and goal observations.
+- The held-out experiment contains 18 unique test mazes evaluated under three learner seeds, not 54 independent maze layouts.
+- Convolution improved held-out success to 22.2%, but that is still far from reliable transfer, especially on larger mazes.
 - Ten successful seeds are encouraging, not proof of universal stability.
 - The 100-episode checkpoint interval is too coarse to compare exact learning speed early in training.
 - CPU timings depend on the machine and compiler. Tabular runs are so short that timer resolution affects their average.
@@ -297,12 +352,12 @@ The finite-difference check perturbs one weight, measures the numerical change i
 
 ## Good next experiments
 
-1. Train across multiple maze layouts and evaluate on held-out mazes.
-2. Replace one-hot identity with inputs that describe local or complete maze geometry.
-3. Record checkpoints more frequently during the first 100 episodes.
-4. Remove replay or the target network one at a time and observe the stability difference.
-5. Add Double DQN and compare its target calculation with ordinary DQN.
-6. Move long training work off the render loop if UI responsiveness becomes important.
+1. Keep the convolutional architecture fixed and train on a much larger or continuously generated maze distribution.
+2. Expand the held-out suite and learner-seed count so confidence intervals are meaningful.
+3. Add evaluation checkpoints during multi-maze training to distinguish slow transfer from late memorization.
+4. Test architectures with stronger long-range planning, such as deeper receptive fields, recurrence, or value-iteration-style modules.
+5. Remove replay or the target network one at a time and observe the stability difference.
+6. Add Double DQN and compare its target calculation with ordinary DQN.
 
 The important question for future DQN work is not only, "Can it solve the maze?" It is:
 
