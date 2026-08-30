@@ -4,9 +4,11 @@
 #include "benchmark.h"
 #include "dqn.h"
 #include "environment.h"
+#include "generalization.h"
 #include "tabular.h"
 #include "trainer.h"
 #include <stdio.h>
+#include <string.h>
 
 #define TRAINING_EPISODES 5000
 #define PREVIEW_MAX_STEPS 60
@@ -42,6 +44,8 @@ static void StartPreview(PolicyPreview *preview)
 int main(int argc, char **argv)
 {
     InitializeAgent();
+    if (argc > 1 && strcmp(argv[1], "--generalization") == 0)
+        return RunGeneralizationExperiment(argc, argv);
     BenchmarkOptions benchmark;
     if (argc > 1) {
         if (!ParseBenchmarkOptions(argc, argv, &benchmark)) {

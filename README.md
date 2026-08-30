@@ -23,7 +23,7 @@ The executable supports both the interactive raylib application and headless exp
 On the current Windows setup, where `gcc` is available but `make` is not on `PATH`, use:
 
 ```powershell
-gcc -std=c11 -O2 -Wall -Wextra -pedantic src\main.c src\maze.c src\agent.c src\environment.c src\rl.c src\rng.c src\learner.c src\tabular.c src\dqn.c src\trainer.c src\benchmark.c -o maze_rl.exe -IC:\msys64\mingw64\include -LC:\msys64\mingw64\lib -lraylib -lopengl32 -lgdi32 -lwinmm -lm
+gcc -std=c11 -O2 -Wall -Wextra -pedantic src\main.c src\maze.c src\agent.c src\environment.c src\rl.c src\rng.c src\learner.c src\tabular.c src\dqn.c src\trainer.c src\benchmark.c src\generalization.c -o maze_rl.exe -IC:\msys64\mingw64\include -LC:\msys64\mingw64\lib -lraylib -lopengl32 -lgdi32 -lwinmm -lm
 .\maze_rl.exe
 ```
 
@@ -71,6 +71,47 @@ The default 5,000-episode comparison was run for seeds 1 through 10:
 
 Both agents had solved the maze by the first 100-episode evaluation checkpoint in every seed. The result illustrates the intended lesson: DQN reaches the same policy, but this fixed discrete maze gives it no generalization benefit to offset its substantially greater computation and memory.
 
+## Held-out maze generalization experiment
+
+The single-maze DQN cannot genuinely generalize because its one-hot input contains only the agent's position. The same position in two different mazes produces the same observation even when walls require different actions. A separate headless experiment tests that limitation and a more informative observation:
+
+- **Position-only baseline:** a 144-element one-hot position in a padded 12 by 12 space.
+- **Layout-aware DQN:** a 13 by 13 agent-centered crop with wall and goal channels, plus normalized goal displacement. This produces 340 inputs and works with every tested size up to 12 by 12.
+
+The deterministic suite contains:
+
+- 16 training mazes, all 10 by 10
+- 6 unseen 10 by 10 mazes to test new layouts
+- 6 unseen 8 by 8 mazes to test smaller layouts
+- 6 unseen 12 by 12 mazes to test larger layouts
+
+Every generated maze is validated with breadth-first search and its optimal route length is recorded. Training samples only the 16 training mazes; held-out mazes never enter replay and never update the network.
+
+Run the default three-seed experiment with:
+
+```powershell
+.\maze_rl.exe --generalization --episodes 5000 --seeds 3 --seed 1 --csv generalization.csv
+```
+
+or, with GNU Make:
+
+```powershell
+make generalization
+```
+
+The CSV includes the reproducible maze-generation seed, split, dimensions, BFS-optimal steps, success, actual steps, optimality gap, return, training time, and model size.
+
+### Initial result and interpretation
+
+A 5,000-episode run with learner seed 1 produced:
+
+| Observation | Training 10 by 10 | Unseen 10 by 10 | Unseen 8 by 8 | Unseen 12 by 12 |
+| --- | ---: | ---: | ---: | ---: |
+| Position only | 0 / 16 | 0 / 6 | 0 / 6 | 0 / 6 |
+| Layout aware | 16 / 16 | 0 / 6 | 1 / 6 | 0 / 6 |
+
+This is evidence of memorization, not generalization. The layout-aware MLP had enough information to distinguish and learn every training maze, but it did not reliably transfer that behavior to unseen layouts. More training on the same 16 maps would not by itself establish generalization. The next architectural hypothesis should introduce spatial weight sharing, such as a convolutional network, and train on a much broader procedural maze distribution.
+
 ## Algorithms
 
 The complete training flow is available as a Graphviz diagram in [`assets/dqn_algorithm.dot`](assets/dqn_algorithm.dot). Render it after installing Graphviz with:
@@ -115,7 +156,7 @@ Let \(s_t\) be the current state, \(a_t \in \mathcal{A}\) one of the four action
 Exploration samples an action uniformly:
 
 $$
-a_t \sim \operatorname{Uniform}(\mathcal{A}).
+a_t \sim \mathrm{Uniform}(\mathcal{A}).
 $$
 
 Exploitation selects an action with maximum online-network value:
@@ -132,7 +173,7 @@ a_t =
 \text{uniform random action}, & u < \epsilon,\\
 \text{random member of }\arg\max_a Q(s_t,a;\theta), & u \ge \epsilon,
 \end{cases}
-\qquad u \sim \operatorname{Uniform}[0,1).
+\qquad u \sim \mathrm{Uniform}[0,1).
 $$
 
 ### Bellman optimality target
@@ -162,7 +203,7 @@ $$
 The implementation uses Huber loss with threshold \(1\):
 
 $$
-\operatorname{Huber}_1(e) =
+\mathrm{Huber}_1(e) =
 \begin{cases}
 \tfrac{1}{2}e^2, & |e| \le 1,\\
 |e| - \tfrac{1}{2}, & |e| > 1,
@@ -171,7 +212,7 @@ $$
 
 $$
 L(\theta) = \frac{1}{|B|}\sum_{j \in B}
-\operatorname{Huber}_1\!\left(y_j-Q(s_j,a_j;\theta)\right),
+\mathrm{Huber}_1\!\left(y_j-Q(s_j,a_j;\theta)\right),
 \qquad |B|=32.
 $$
 
@@ -191,7 +232,7 @@ $$
 
 $$
 \theta \leftarrow
-\operatorname{Adam}\!\left(\theta,g_{\mathrm{clipped}};
+\mathrm{Adam}\!\left(\theta,g_{\mathrm{clipped}};
 \alpha=10^{-3},\beta_1=0.9,\beta_2=0.999,\varepsilon_{\mathrm{Adam}}=10^{-8}\right).
 $$
 
@@ -224,7 +265,7 @@ starting from \(\epsilon_0=1.0\).
 For one-hot state vector \(x(s)\in\mathbb{R}^{100}\):
 
 $$
-h = \operatorname{ReLU}(W_1x(s)+b_1),
+h = \mathrm{ReLU}(W_1x(s)+b_1),
 \qquad
 Q(s,\cdot;\theta)=W_2h+b_2,
 $$
@@ -265,6 +306,7 @@ src/
 |-- dqn.c/.h           Neural network, replay, target network, and Adam
 |-- trainer.c/.h       Shared episode and metric logic
 |-- benchmark.c/.h     Seeded headless comparison and CSV export
+|-- generalization.c/.h  Multi-maze and cross-size held-out experiment
 |-- rng.c/.h           Deterministic project RNG
 |-- maze.c/.h          Maze state and rendering
 `-- agent.c/.h         Movement and model-independent visualization

@@ -10,7 +10,7 @@ LIB_SOURCES := $(filter-out src/main.c src/benchmark.c,$(SOURCES))
 TARGET := maze_rl.exe
 TEST_TARGET := test_rl.exe
 
-.PHONY: all benchmark test clean
+.PHONY: all benchmark generalization test clean
 
 all: $(TARGET)
 
@@ -25,6 +25,9 @@ test: $(TEST_TARGET)
 
 benchmark: $(TARGET)
 	./$(TARGET) --benchmark --agent both --episodes 5000 --seeds 10 --seed 1 --csv comparison.csv
+
+generalization: $(TARGET)
+	./$(TARGET) --generalization --episodes 5000 --seeds 3 --seed 1 --csv generalization.csv
 
 clean:
 	rm -f $(TARGET) $(TEST_TARGET)
