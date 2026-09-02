@@ -15,6 +15,7 @@
 #define GEN_ACTIONS 4
 #define GEN_TRAIN_MAZES 16
 #define GEN_TEST_PER_GROUP 6
+#define GEN_POOL_CAP 256
 #define GEN_MAZE_COUNT (GEN_TRAIN_MAZES + 3 * GEN_TEST_PER_GROUP)
 #define GEN_REPLAY_CAPACITY 10000
 #define GEN_REPLAY_WARMUP 500
@@ -61,8 +62,18 @@ typedef struct {
     char name[32];
 } ExperimentMaze;
 
+/* Everything Encode()/ForwardState() need to observe a maze, decoupled from
+   the fixed ExperimentMaze suite so a freshly generated procedural maze can
+   be observed the same way as one of the deterministic held-out mazes. */
 typedef struct {
-    int mazeIndex;
+    int width;
+    int height;
+    unsigned char wall[GEN_MAX_CELLS];
+    int goalState;
+} GenMazeView;
+
+typedef struct {
+    GenMazeView maze;
     int state;
     Action action;
     float reward;
@@ -89,7 +100,6 @@ typedef struct {
     int updates;
     int environmentSteps;
     ObservationKind observation;
-    const ExperimentMaze *mazes;
 } GenDqn;
 
 typedef struct {
@@ -111,6 +121,11 @@ typedef struct {
     int seeds;
     uint64_t firstSeed;
     const char *csvPath;
+    bool procedural;
+    int proceduralMinSize;
+    int proceduralMaxSize;
+    int proceduralRegenEvery;
+    bool randomGoals;
 } GenOptions;
 
 typedef struct {
@@ -140,33 +155,179 @@ static int StateOf(int x, int y) { return y * GEN_MAX_SIZE + x; }
 static int StateX(int state) { return state % GEN_MAX_SIZE; }
 static int StateY(int state) { return state / GEN_MAX_SIZE; }
 
-static int ShortestPath(const ExperimentMaze *maze)
+static int ShortestPathGeneric(
+    int width,
+    int height,
+    const unsigned char wall[GEN_MAX_CELLS],
+    int startState,
+    int goalState)
 {
     int distance[GEN_MAX_CELLS];
     int queue[GEN_MAX_CELLS];
     for (int i = 0; i < GEN_MAX_CELLS; i++) distance[i] = -1;
     int front = 0;
     int back = 0;
-    queue[back++] = maze->startState;
-    distance[maze->startState] = 0;
+    queue[back++] = startState;
+    distance[startState] = 0;
     static const int dx[GEN_ACTIONS] = {0, 1, 0, -1};
     static const int dy[GEN_ACTIONS] = {-1, 0, 1, 0};
     while (front < back) {
         int state = queue[front++];
-        if (state == maze->goalState) return distance[state];
+        if (state == goalState) return distance[state];
         int x = StateX(state);
         int y = StateY(state);
         for (int action = 0; action < GEN_ACTIONS; action++) {
             int nx = x + dx[action];
             int ny = y + dy[action];
-            if (nx < 0 || nx >= maze->width || ny < 0 || ny >= maze->height) continue;
+            if (nx < 0 || nx >= width || ny < 0 || ny >= height) continue;
             int next = StateOf(nx, ny);
-            if (maze->wall[next] || distance[next] >= 0) continue;
+            if (wall[next] || distance[next] >= 0) continue;
             distance[next] = distance[state] + 1;
             queue[back++] = next;
         }
     }
     return -1;
+}
+
+static int ShortestPath(const ExperimentMaze *maze)
+{
+    return ShortestPathGeneric(maze->width, maze->height, maze->wall,
+        maze->startState, maze->goalState);
+}
+
+static GenMazeView ViewOfMaze(const ExperimentMaze *maze)
+{
+    GenMazeView view;
+    view.width = maze->width;
+    view.height = maze->height;
+    memcpy(view.wall, maze->wall, sizeof(view.wall));
+    view.goalState = maze->goalState;
+    return view;
+}
+
+static int RandomOpenInteriorCell(int width, int height, Rng *rng)
+{
+    int x = 1 + RngRange(rng, width - 2);
+    int y = 1 + RngRange(rng, height - 2);
+    return StateOf(x, y);
+}
+
+/* Generates one procedural training maze: a random square size in
+   [minSize, maxSize], with a random (not corner-fixed) start and goal cell.
+   Mirrors GenerateMaze's rejection-sampling approach (random interior walls
+   at 24% density, keep the best-connected attempt out of 4000, require a
+   BFS path meaningfully longer than the direct Manhattan distance) but
+   randomizes start/goal instead of pinning them to opposite corners. */
+static void GenerateProceduralMaze(
+    GenMazeView *view,
+    int *startState,
+    int minSize,
+    int maxSize,
+    Rng *rng)
+{
+    int size = minSize + (minSize == maxSize ? 0 : RngRange(rng, maxSize - minSize + 1));
+    view->width = size;
+    view->height = size;
+    unsigned char best[GEN_MAX_CELLS];
+    int bestStart = StateOf(1, 1);
+    int bestGoal = StateOf(size - 2, size - 2);
+    int bestDistance = -1;
+
+    for (int attempt = 0; attempt < 4000; attempt++) {
+        memset(view->wall, 1, sizeof(view->wall));
+        for (int y = 1; y < size - 1; y++) {
+            for (int x = 1; x < size - 1; x++)
+                view->wall[StateOf(x, y)] = RngFloat(rng) < 0.24f ? 1 : 0;
+        }
+        int candidateStart = RandomOpenInteriorCell(size, size, rng);
+        int candidateGoal = RandomOpenInteriorCell(size, size, rng);
+        if (candidateGoal == candidateStart) continue;
+        view->wall[candidateStart] = 0;
+        view->wall[candidateGoal] = 0;
+        int distance = ShortestPathGeneric(size, size, view->wall, candidateStart, candidateGoal);
+        if (distance > bestDistance) {
+            bestDistance = distance;
+            bestStart = candidateStart;
+            bestGoal = candidateGoal;
+            memcpy(best, view->wall, sizeof(best));
+        }
+        int manhattan = abs(StateX(candidateGoal) - StateX(candidateStart)) +
+            abs(StateY(candidateGoal) - StateY(candidateStart));
+        if (distance >= manhattan + 2) {
+            *startState = candidateStart;
+            view->goalState = candidateGoal;
+            return;
+        }
+    }
+
+    if (bestDistance < 0) {
+        /* Extremely unlikely fallback: no attempt connected start to goal.
+           Fall back to a fully open interior so the maze is always solvable. */
+        memset(best, 1, sizeof(best));
+        for (int y = 1; y < size - 1; y++)
+            for (int x = 1; x < size - 1; x++) best[StateOf(x, y)] = 0;
+        bestStart = StateOf(1, 1);
+        bestGoal = StateOf(size - 2, size - 2);
+    }
+    memcpy(view->wall, best, sizeof(best));
+    *startState = bestStart;
+    view->goalState = bestGoal;
+}
+
+static int CollectOpenInteriorCells(const ExperimentMaze *maze, int cells[GEN_MAX_CELLS])
+{
+    int count = 0;
+    for (int y = 1; y < maze->height - 1; y++) {
+        for (int x = 1; x < maze->width - 1; x++) {
+            int state = StateOf(x, y);
+            if (!maze->wall[state]) cells[count++] = state;
+        }
+    }
+    return count;
+}
+
+/* Isolates the "random starts" claim from procedural generation: keeps a
+   fixed maze's wall layout exactly as generated, and only swaps in a random
+   pair of open cells as start/goal, subject to the same minimum-distance
+   rejection sampling as GenerateProceduralMaze. Falls back to the maze's own
+   canonical start/goal if no open pair is ever reachable (should not happen
+   for a validated, connected maze, but the fixed suite is untouched here so
+   this is defensive rather than load-bearing). */
+static void RandomizeStartGoal(
+    const ExperimentMaze *maze,
+    int *startState,
+    int *goalState,
+    Rng *rng)
+{
+    int open[GEN_MAX_CELLS];
+    int count = CollectOpenInteriorCells(maze, open);
+    int bestStart = maze->startState;
+    int bestGoal = maze->goalState;
+    int bestDistance = -1;
+    int attempts = count > 1 ? 200 : 0;
+    for (int attempt = 0; attempt < attempts; attempt++) {
+        int a = RngRange(rng, count);
+        int b = RngRange(rng, count);
+        if (a == b) continue;
+        int candidateStart = open[a];
+        int candidateGoal = open[b];
+        int distance = ShortestPathGeneric(
+            maze->width, maze->height, maze->wall, candidateStart, candidateGoal);
+        if (distance > bestDistance) {
+            bestDistance = distance;
+            bestStart = candidateStart;
+            bestGoal = candidateGoal;
+        }
+        int manhattan = abs(StateX(candidateGoal) - StateX(candidateStart)) +
+            abs(StateY(candidateGoal) - StateY(candidateStart));
+        if (distance >= manhattan + 2) {
+            *startState = candidateStart;
+            *goalState = candidateGoal;
+            return;
+        }
+    }
+    *startState = bestStart;
+    *goalState = bestGoal;
 }
 
 static void GenerateMaze(
@@ -277,7 +438,7 @@ static int ConvParameterCount(void) { return ConvOutputBiasesOffset() + GEN_ACTI
 
 static void Encode(
     const GenDqn *dqn,
-    int mazeIndex,
+    const GenMazeView *maze,
     int state,
     float output[GEN_MAX_INPUT])
 {
@@ -287,7 +448,6 @@ static void Encode(
         return;
     }
 
-    const ExperimentMaze *maze = &dqn->mazes[mazeIndex];
     int agentX = StateX(state);
     int agentY = StateY(state);
     int goalX = StateX(maze->goalState);
@@ -413,11 +573,11 @@ static void ForwardConv(const float *parameters, GenForward *cache)
 static void ForwardState(
     const GenDqn *dqn,
     const float *parameters,
-    int mazeIndex,
+    const GenMazeView *maze,
     int state,
     GenForward *cache)
 {
-    Encode(dqn, mazeIndex, state, cache->input);
+    Encode(dqn, maze, state, cache->input);
     if (dqn->observation == OBS_CONV) ForwardConv(parameters, cache);
     else ForwardMlp(dqn, parameters, cache);
 }
@@ -425,12 +585,10 @@ static void ForwardState(
 static bool InitializeDqn(
     GenDqn *dqn,
     ObservationKind observation,
-    const ExperimentMaze *mazes,
     Rng *rng)
 {
     memset(dqn, 0, sizeof(*dqn));
     dqn->observation = observation;
-    dqn->mazes = mazes;
     dqn->inputSize = observation == OBS_POSITION ? GEN_POSITION_INPUT : GEN_LAYOUT_INPUT;
     dqn->hiddenSize = observation == OBS_POSITION ? 32 : 64;
     dqn->parameterCount = observation == OBS_CONV ?
@@ -482,11 +640,16 @@ static void DestroyDqn(GenDqn *dqn)
     memset(dqn, 0, sizeof(*dqn));
 }
 
-static Action SelectAction(GenDqn *dqn, int mazeIndex, int state, float epsilon, Rng *rng)
+static Action SelectAction(
+    GenDqn *dqn,
+    const GenMazeView *maze,
+    int state,
+    float epsilon,
+    Rng *rng)
 {
     if (RngFloat(rng) < epsilon) return (Action)RngRange(rng, GEN_ACTIONS);
     GenForward cache;
-    ForwardState(dqn, dqn->online, mazeIndex, state, &cache);
+    ForwardState(dqn, dqn->online, maze, state, &cache);
     Action best[GEN_ACTIONS];
     int count = 1;
     float maximum = cache.values[0];
@@ -503,7 +666,7 @@ static Action SelectAction(GenDqn *dqn, int mazeIndex, int state, float epsilon,
     return best[RngRange(rng, count)];
 }
 
-static GenTransition TakeStep(const ExperimentMaze *maze, int mazeIndex, int state, Action action)
+static GenTransition TakeStep(const GenMazeView *maze, int state, Action action)
 {
     static const int dx[GEN_ACTIONS] = {0, 1, 0, -1};
     static const int dy[GEN_ACTIONS] = {-1, 0, 1, 0};
@@ -516,7 +679,7 @@ static GenTransition TakeStep(const ExperimentMaze *maze, int mazeIndex, int sta
     int nextState = blocked ? state : StateOf(nx, ny);
     bool done = nextState == maze->goalState;
     return (GenTransition){
-        mazeIndex,
+        *maze,
         state,
         action,
         done ? 100.0f : blocked ? -5.0f : -1.0f,
@@ -661,13 +824,13 @@ static void TrainBatch(GenDqn *dqn, Rng *rng)
         GenTransition transition = dqn->replay.entries[RngRange(rng, dqn->replay.count)];
         GenForward current;
         ForwardState(
-            dqn, dqn->online, transition.mazeIndex, transition.state, &current);
+            dqn, dqn->online, &transition.maze, transition.state, &current);
 
         float target = transition.reward;
         if (!transition.done) {
             GenForward next;
             ForwardState(
-                dqn, dqn->target, transition.mazeIndex, transition.nextState, &next);
+                dqn, dqn->target, &transition.maze, transition.nextState, &next);
             target += 0.95f * Maximum(next.values);
         }
         float error = current.values[transition.action] - target;
@@ -703,12 +866,13 @@ static bool ConvGradientSelfTest(const ExperimentMaze mazes[GEN_MAZE_COUNT])
     Rng rng;
     RngSeed(&rng, UINT64_C(0x12345678));
     GenDqn dqn;
-    if (!InitializeDqn(&dqn, OBS_CONV, mazes, &rng)) {
+    if (!InitializeDqn(&dqn, OBS_CONV, &rng)) {
         DestroyDqn(&dqn);
         return false;
     }
+    GenMazeView maze = ViewOfMaze(&mazes[0]);
     GenForward cache;
-    ForwardState(&dqn, dqn.online, 0, mazes[0].startState, &cache);
+    ForwardState(&dqn, dqn.online, &maze, mazes[0].startState, &cache);
     const Action action = ACTION_RIGHT;
     const float target = cache.values[action] - 0.25f;
     memset(dqn.gradient, 0, sizeof(float) * (size_t)dqn.parameterCount);
@@ -730,12 +894,12 @@ static bool ConvGradientSelfTest(const ExperimentMaze mazes[GEN_MAZE_COUNT])
     float original = dqn.online[parameter];
     dqn.online[parameter] = original + epsilon;
     GenForward plus;
-    ForwardState(&dqn, dqn.online, 0, mazes[0].startState, &plus);
+    ForwardState(&dqn, dqn.online, &maze, mazes[0].startState, &plus);
     float plusError = plus.values[action] - target;
     float plusLoss = 0.5f * plusError * plusError;
     dqn.online[parameter] = original - epsilon;
     GenForward minus;
-    ForwardState(&dqn, dqn.online, 0, mazes[0].startState, &minus);
+    ForwardState(&dqn, dqn.online, &maze, mazes[0].startState, &minus);
     float minusError = minus.values[action] - target;
     float minusLoss = 0.5f * minusError * minusError;
     dqn.online[parameter] = original;
@@ -748,17 +912,17 @@ static bool ConvGradientSelfTest(const ExperimentMaze mazes[GEN_MAZE_COUNT])
 
 static GenEpisode RunEpisode(
     GenDqn *dqn,
-    int mazeIndex,
+    const GenMazeView *maze,
+    int startState,
     float epsilon,
     bool learn,
     Rng *rng)
 {
-    const ExperimentMaze *maze = &dqn->mazes[mazeIndex];
     GenEpisode result = {0};
-    int state = maze->startState;
+    int state = startState;
     for (int step = 0; step < GEN_MAX_STEPS; step++) {
-        Action action = SelectAction(dqn, mazeIndex, state, epsilon, rng);
-        GenTransition transition = TakeStep(maze, mazeIndex, state, action);
+        Action action = SelectAction(dqn, maze, state, epsilon, rng);
+        GenTransition transition = TakeStep(maze, state, action);
         if (learn) {
             ReplayPush(dqn, transition);
             dqn->environmentSteps++;
@@ -775,7 +939,7 @@ static GenEpisode RunEpisode(
 
 static GenOptions DefaultOptions(void)
 {
-    return (GenOptions){5000, 3, 1, "generalization.csv"};
+    return (GenOptions){5000, 3, 1, "generalization.csv", false, 6, 12, 1, false};
 }
 
 static bool ParsePositive(const char *text, int *value)
@@ -801,8 +965,22 @@ static bool ParseOptions(int argc, char **argv, GenOptions *options)
             options->firstSeed = (uint64_t)seed;
         } else if (strcmp(argv[i], "--csv") == 0 && i + 1 < argc) {
             options->csvPath = argv[++i];
+        } else if (strcmp(argv[i], "--procedural") == 0) {
+            options->procedural = true;
+        } else if (strcmp(argv[i], "--min-size") == 0 && i + 1 < argc) {
+            if (!ParsePositive(argv[++i], &options->proceduralMinSize)) return false;
+        } else if (strcmp(argv[i], "--max-size") == 0 && i + 1 < argc) {
+            if (!ParsePositive(argv[++i], &options->proceduralMaxSize)) return false;
+        } else if (strcmp(argv[i], "--regen-every") == 0 && i + 1 < argc) {
+            if (!ParsePositive(argv[++i], &options->proceduralRegenEvery)) return false;
+        } else if (strcmp(argv[i], "--random-goals") == 0) {
+            options->randomGoals = true;
         } else return false;
     }
+    if (options->proceduralMinSize < 3 || options->proceduralMaxSize > GEN_MAX_SIZE ||
+        options->proceduralMinSize > options->proceduralMaxSize)
+        return false;
+    if (options->procedural && options->randomGoals) return false;
     return true;
 }
 
@@ -871,17 +1049,18 @@ static void FeaturedMazeIndices(int indices[GEN_VIDEO_MAZES])
 
 static GenVideoTrajectory RecordVideoTrajectory(
     GenDqn *dqn,
-    int mazeIndex,
+    const GenMazeView *maze,
+    int startState,
     uint64_t evaluationSeed)
 {
     GenVideoTrajectory trajectory = {0};
     Rng rng;
     RngSeed(&rng, evaluationSeed);
-    int state = dqn->mazes[mazeIndex].startState;
+    int state = startState;
     trajectory.states[0] = state;
     for (int step = 0; step < GEN_MAX_STEPS; step++) {
-        Action action = SelectAction(dqn, mazeIndex, state, 0.0f, &rng);
-        GenTransition transition = TakeStep(&dqn->mazes[mazeIndex], mazeIndex, state, action);
+        Action action = SelectAction(dqn, maze, state, 0.0f, &rng);
+        GenTransition transition = TakeStep(maze, state, action);
         trajectory.totalReward += transition.reward;
         trajectory.steps = step + 1;
         state = transition.nextState;
@@ -915,7 +1094,7 @@ static bool CaptureVideoCheckpoints(
     Rng rng;
     RngSeed(&rng, seed ^ ((uint64_t)OBS_CONV << 48));
     GenDqn dqn;
-    if (!InitializeDqn(&dqn, OBS_CONV, mazes, &rng)) {
+    if (!InitializeDqn(&dqn, OBS_CONV, &rng)) {
         DestroyDqn(&dqn);
         return false;
     }
@@ -939,7 +1118,8 @@ static bool CaptureVideoCheckpoints(
         }
         if (episode == episodes) break;
         int mazeIndex = RngRange(&rng, GEN_TRAIN_MAZES);
-        RunEpisode(&dqn, mazeIndex, epsilon, true, &rng);
+        GenMazeView trainMaze = ViewOfMaze(&mazes[mazeIndex]);
+        RunEpisode(&dqn, &trainMaze, mazes[mazeIndex].startState, epsilon, true, &rng);
         epsilon *= 0.9995f;
         if (epsilon < 0.05f) epsilon = 0.05f;
     }
@@ -952,8 +1132,9 @@ static bool CaptureVideoCheckpoints(
             int mazeIndex = mazeIndices[mazeSlot];
             uint64_t evaluationSeed = seed ^ (uint64_t)(mazeIndex + 1) ^
                 UINT64_C(0x6a09e667);
-            checkpoints[checkpointIndex].trajectories[mazeSlot] =
-                RecordVideoTrajectory(&dqn, mazeIndex, evaluationSeed);
+            GenMazeView evalMaze = ViewOfMaze(&mazes[mazeIndex]);
+            checkpoints[checkpointIndex].trajectories[mazeSlot] = RecordVideoTrajectory(
+                &dqn, &evalMaze, mazes[mazeIndex].startState, evaluationSeed);
         }
     }
     DestroyDqn(&dqn);
@@ -970,21 +1151,66 @@ static int RunOne(
     FILE *csv,
     const ExperimentMaze mazes[GEN_MAZE_COUNT],
     ObservationKind observation,
-    int episodes,
+    const GenOptions *options,
     uint64_t seed)
 {
     Rng rng;
     RngSeed(&rng, seed ^ ((uint64_t)observation << 48));
     GenDqn dqn;
-    if (!InitializeDqn(&dqn, observation, mazes, &rng)) {
+    if (!InitializeDqn(&dqn, observation, &rng)) {
         DestroyDqn(&dqn);
         return 1;
     }
+    char trainMode[32];
+    if (options->procedural) {
+        snprintf(trainMode, sizeof(trainMode), "procedural_%dto%d",
+            options->proceduralMinSize, options->proceduralMaxSize);
+    } else if (options->randomGoals) {
+        snprintf(trainMode, sizeof(trainMode), "fixed_%d_random_goals", GEN_TRAIN_MAZES);
+    } else {
+        snprintf(trainMode, sizeof(trainMode), "fixed_%d", GEN_TRAIN_MAZES);
+    }
+
     float epsilon = 1.0f;
+    GenMazeView proceduralMaze = {0};
+    int proceduralStart = 0;
+    /* Records every distinct procedural maze this run actually trained on
+       (up to GEN_POOL_CAP), so we can separately measure whether the network
+       fits its own training pool versus generalizes beyond it. */
+    GenMazeView poolMazes[GEN_POOL_CAP];
+    int poolStarts[GEN_POOL_CAP];
+    int poolCount = 0;
     clock_t start = clock();
-    for (int episode = 0; episode < episodes; episode++) {
-        int mazeIndex = RngRange(&rng, GEN_TRAIN_MAZES);
-        RunEpisode(&dqn, mazeIndex, epsilon, true, &rng);
+    for (int episode = 0; episode < options->episodes; episode++) {
+        if (options->procedural) {
+            if (episode % options->proceduralRegenEvery == 0) {
+                GenerateProceduralMaze(&proceduralMaze, &proceduralStart,
+                    options->proceduralMinSize, options->proceduralMaxSize, &rng);
+                if (poolCount < GEN_POOL_CAP) {
+                    poolMazes[poolCount] = proceduralMaze;
+                    poolStarts[poolCount] = proceduralStart;
+                    poolCount++;
+                }
+            }
+            RunEpisode(&dqn, &proceduralMaze, proceduralStart, epsilon, true, &rng);
+        } else if (options->randomGoals) {
+            int mazeIndex = RngRange(&rng, GEN_TRAIN_MAZES);
+            GenMazeView trainMaze = ViewOfMaze(&mazes[mazeIndex]);
+            int randomStart;
+            int randomGoal;
+            RandomizeStartGoal(&mazes[mazeIndex], &randomStart, &randomGoal, &rng);
+            trainMaze.goalState = randomGoal;
+            if (poolCount < GEN_POOL_CAP) {
+                poolMazes[poolCount] = trainMaze;
+                poolStarts[poolCount] = randomStart;
+                poolCount++;
+            }
+            RunEpisode(&dqn, &trainMaze, randomStart, epsilon, true, &rng);
+        } else {
+            int mazeIndex = RngRange(&rng, GEN_TRAIN_MAZES);
+            GenMazeView trainMaze = ViewOfMaze(&mazes[mazeIndex]);
+            RunEpisode(&dqn, &trainMaze, mazes[mazeIndex].startState, epsilon, true, &rng);
+        }
         epsilon *= 0.9995f;
         if (epsilon < 0.05f) epsilon = 0.05f;
     }
@@ -995,12 +1221,15 @@ static int RunOne(
     for (int mazeIndex = 0; mazeIndex < GEN_MAZE_COUNT; mazeIndex++) {
         Rng evaluationRng;
         RngSeed(&evaluationRng, seed ^ (uint64_t)(mazeIndex + 1) ^ UINT64_C(0x6a09e667));
-        GenEpisode evaluation = RunEpisode(&dqn, mazeIndex, 0.0f, false, &evaluationRng);
+        GenMazeView evalMaze = ViewOfMaze(&mazes[mazeIndex]);
+        GenEpisode evaluation = RunEpisode(
+            &dqn, &evalMaze, mazes[mazeIndex].startState, 0.0f, false, &evaluationRng);
         const ExperimentMaze *maze = &mazes[mazeIndex];
         int gap = evaluation.reachedGoal ? evaluation.steps - maze->optimalSteps : -1;
-        fprintf(csv, "%llu,%s,%s,%s,%llu,%dx%d,%d,%d,%d,%d,%.1f,%.3f,%d\n",
+        fprintf(csv, "%llu,%s,%s,%s,%s,%llu,%dx%d,%d,%d,%d,%d,%.1f,%.3f,%d\n",
             (unsigned long long)seed,
             ObservationName(observation),
+            trainMode,
             maze->split,
             maze->name,
             (unsigned long long)maze->generationSeed,
@@ -1019,11 +1248,26 @@ static int RunOne(
         groupTotal[group]++;
         if (evaluation.reachedGoal) groupSuccess[group]++;
     }
-    printf("seed=%llu observation=%s train=%d/%d same=%d/%d smaller=%d/%d larger=%d/%d time=%.0fms\n",
+    int poolSuccess = 0;
+    if (options->procedural || options->randomGoals) {
+        for (int p = 0; p < poolCount; p++) {
+            Rng poolRng;
+            RngSeed(&poolRng, seed ^ (uint64_t)p ^ UINT64_C(0x9e3779b97f4a7c15));
+            GenEpisode poolEval = RunEpisode(
+                &dqn, &poolMazes[p], poolStarts[p], 0.0f, false, &poolRng);
+            if (poolEval.reachedGoal) poolSuccess++;
+        }
+    }
+
+    printf("seed=%llu observation=%s train_mode=%s train=%d/%d same=%d/%d smaller=%d/%d larger=%d/%d",
         (unsigned long long)seed,
         ObservationName(observation),
+        trainMode,
         groupSuccess[0], groupTotal[0], groupSuccess[1], groupTotal[1],
-        groupSuccess[2], groupTotal[2], groupSuccess[3], groupTotal[3], elapsed);
+        groupSuccess[2], groupTotal[2], groupSuccess[3], groupTotal[3]);
+    if (options->procedural || options->randomGoals)
+        printf(" pool_fit=%d/%d", poolSuccess, poolCount);
+    printf(" time=%.0fms\n", elapsed);
     DestroyDqn(&dqn);
     return 0;
 }
@@ -1032,7 +1276,8 @@ int RunGeneralizationExperiment(int argc, char **argv)
 {
     GenOptions options;
     if (!ParseOptions(argc, argv, &options)) {
-        fprintf(stderr, "Usage: %s --generalization [--episodes N] [--seeds N] [--seed N] [--csv FILE]\n", argv[0]);
+        fprintf(stderr, "Usage: %s --generalization [--episodes N] [--seeds N] [--seed N] [--csv FILE] "
+            "[--procedural] [--min-size N] [--max-size N] [--regen-every N] [--random-goals]\n", argv[0]);
         return 2;
     }
     ExperimentMaze mazes[GEN_MAZE_COUNT];
@@ -1048,13 +1293,13 @@ int RunGeneralizationExperiment(int argc, char **argv)
         fprintf(stderr, "Could not open CSV output: %s\n", options.csvPath);
         return 1;
     }
-    fprintf(csv, "seed,observation,split,maze,maze_seed,size,optimal_steps,success,steps,excess_steps,return,training_ms,parameters\n");
+    fprintf(csv, "seed,observation,train_mode,split,maze,maze_seed,size,optimal_steps,success,steps,excess_steps,return,training_ms,parameters\n");
     int status = 0;
     for (int offset = 0; offset < options.seeds && status == 0; offset++) {
         uint64_t seed = options.firstSeed + (uint64_t)offset;
-        status = RunOne(csv, mazes, OBS_POSITION, options.episodes, seed);
-        if (status == 0) status = RunOne(csv, mazes, OBS_LAYOUT, options.episodes, seed);
-        if (status == 0) status = RunOne(csv, mazes, OBS_CONV, options.episodes, seed);
+        status = RunOne(csv, mazes, OBS_POSITION, &options, seed);
+        if (status == 0) status = RunOne(csv, mazes, OBS_LAYOUT, &options, seed);
+        if (status == 0) status = RunOne(csv, mazes, OBS_CONV, &options, seed);
         fflush(csv);
     }
     fclose(csv);
@@ -1388,13 +1633,31 @@ bool GeneralizationRunSelfTests(void)
             mazes[i].wall[mazes[i].startState] || mazes[i].wall[mazes[i].goalState])
             return false;
     }
-    GenTransition wall = TakeStep(&mazes[0], 0, mazes[0].startState, ACTION_UP);
+    GenMazeView firstMaze = ViewOfMaze(&mazes[0]);
+    GenTransition wall = TakeStep(&firstMaze, mazes[0].startState, ACTION_UP);
     if (wall.nextState != mazes[0].startState || wall.reward != -5.0f || wall.done)
         return false;
     if (GEN_LAYOUT_INPUT != 340 || MlpParameterCount(GEN_LAYOUT_INPUT, 64) != 22084 ||
         GEN_CONV1_SIDE != 11 || GEN_CONV2_SIDE != 5 || ConvParameterCount() != 13624)
         return false;
     if (!ConvGradientSelfTest(mazes)) return false;
+
+    Rng proceduralRng;
+    RngSeed(&proceduralRng, UINT64_C(0x9e3779b97f4a7c15));
+    for (int i = 0; i < 200; i++) {
+        GenMazeView view;
+        int startState;
+        GenerateProceduralMaze(&view, &startState, 6, 12, &proceduralRng);
+        if (view.width < 6 || view.width > 12 || view.height != view.width) return false;
+        if (view.wall[startState] || view.wall[view.goalState]) return false;
+        if (startState == view.goalState) return false;
+        if (ShortestPathGeneric(view.width, view.height, view.wall, startState, view.goalState) < 0)
+            return false;
+    }
+    GenMazeView fixedSizeView;
+    int fixedSizeStart;
+    GenerateProceduralMaze(&fixedSizeView, &fixedSizeStart, 8, 8, &proceduralRng);
+    if (fixedSizeView.width != 8 || fixedSizeView.height != 8) return false;
 
     int checkpointEpisodes[GEN_VIDEO_MAX_CHECKPOINTS];
     int checkpointCount = BuildVideoCheckpointEpisodes(5000, checkpointEpisodes);
@@ -1421,7 +1684,7 @@ bool GeneralizationRunSelfTests(void)
     Rng videoRng;
     RngSeed(&videoRng, UINT64_C(1) ^ ((uint64_t)OBS_CONV << 48));
     GenDqn videoDqn;
-    if (!InitializeDqn(&videoDqn, OBS_CONV, mazes, &videoRng)) {
+    if (!InitializeDqn(&videoDqn, OBS_CONV, &videoRng)) {
         DestroyDqn(&videoDqn);
         return false;
     }
@@ -1431,10 +1694,11 @@ bool GeneralizationRunSelfTests(void)
     float parameterBefore = videoDqn.online[0];
     uint64_t evaluationSeed = UINT64_C(1) ^ (uint64_t)(mazeIndices[0] + 1) ^
         UINT64_C(0x6a09e667);
-    GenVideoTrajectory first =
-        RecordVideoTrajectory(&videoDqn, mazeIndices[0], evaluationSeed);
-    GenVideoTrajectory second =
-        RecordVideoTrajectory(&videoDqn, mazeIndices[0], evaluationSeed);
+    GenMazeView firstMazeView = ViewOfMaze(&mazes[mazeIndices[0]]);
+    GenVideoTrajectory first = RecordVideoTrajectory(
+        &videoDqn, &firstMazeView, mazes[mazeIndices[0]].startState, evaluationSeed);
+    GenVideoTrajectory second = RecordVideoTrajectory(
+        &videoDqn, &firstMazeView, mazes[mazeIndices[0]].startState, evaluationSeed);
     bool trajectoryValid = first.steps >= 1 && first.steps <= GEN_MAX_STEPS &&
         first.steps == second.steps && first.reachedGoal == second.reachedGoal &&
         first.totalReward == second.totalReward;

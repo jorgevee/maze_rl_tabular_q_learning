@@ -112,7 +112,64 @@ A 5,000-episode run with learner seeds 1 through 3 produced:
 | Layout-aware MLP | 48 / 48 | 1 / 18 | 1 / 18 | 0 / 18 | 2 / 54 |
 | Convolutional | 48 / 48 | 5 / 18 | 6 / 18 | 1 / 18 | 12 / 54 |
 
-The MLP result is evidence of memorization. Convolution raised held-out success from 3.7% to 22.2% while reducing parameter count from 22,084 to 13,624, showing that spatial weight sharing is a better inductive bias for this task. It still failed most held-out evaluations, especially larger mazes, so the next controlled experiment should keep the convolutional architecture fixed and broaden the procedural training distribution.
+The MLP result is evidence of memorization. Convolution raised held-out success from 3.7% to 22.2% while reducing parameter count from 22,084 to 13,624. It still failed most held-out evaluations, especially larger mazes.
+
+**Update:** the "spatial weight sharing is a better inductive bias" reading of this gap does not survive a follow-up control. Both mazes in this baseline always place the goal at the same corner relative to the start, and the `--random-goals` experiment further below shows the convolutional model's entire held-out advantage disappears once that shared corner-to-corner direction is removed, while wall-layout diversity and architecture are held fixed. The gap here looks substantially explained by the convolutional model exploiting that shared direction more effectively than the MLP, not by superior maze-solving ability.
+
+### Procedural training distribution
+
+The 12/54 result above is capped by the training distribution as much as by the architecture: all 16 training mazes are 10 by 10 with the start pinned to `(1,1)` and the goal to the opposite corner, so the network can partly learn "head down and right" instead of "find a path to wherever the goal is." `--procedural` replaces that fixed set with a freshly generated maze every training episode, with a random size in `[--min-size, --max-size]` and a random start and goal cell (instead of fixed corners) each time. The held-out evaluation suite is untouched, so results are directly comparable to the fixed-training baseline above.
+
+```powershell
+.\maze_rl.exe --generalization --episodes 5000 --seeds 3 --seed 1 --procedural --min-size 6 --max-size 12 --regen-every 1 --csv generalization_procedural.csv
+```
+
+or with GNU Make:
+
+```powershell
+make generalization-procedural
+```
+
+`--regen-every N` (default 1) generates a new procedural maze every `N` episodes instead of every episode. The CSV gains a `train_mode` column (`fixed_16` or `procedural_<min>to<max>`) so fixed and procedural runs can sit in the same file. Passing no `--procedural` flag reproduces the exact fixed-training run above bit-for-bit (verified: identical success/steps/return/parameters per maze, only wall-clock training time differs).
+
+**Result: at the same 5,000-episode budget, procedural training made held-out performance worse, not better.**
+
+| Training regime | Held-out 10x10 | Held-out 8x8 | Held-out 12x12 | All held-out |
+| --- | ---: | ---: | ---: | ---: |
+| Fixed 16 mazes (baseline) | 5/18 | 6/18 | 1/18 | 12/54 |
+| Procedural, fresh maze every episode | 0/18 | 1/18 | 0/18 | 1/54 |
+| Procedural, fresh maze every 300 episodes (~17-maze pool) | 0/18 | 0/18 | 0/18 | 0/54 |
+
+Both convolutional runs used identical episode budget, architecture, and held-out suite. Adding a diagnostic ("pool fit": greedy success on the mazes actually seen during training, evaluated by the final network) explains why:
+
+- **Fresh-every-episode:** ~42% pool fit (108-115/256 sampled early-training mazes) despite ~2% on the fixed suite. The network does learn something transferable about navigating this procedural distribution, it just doesn't transfer to the fixed suite's specific task.
+- **300-episode pool (~17 mazes, ~300 exposures each):** only 2-4/17 (12-24%) pool fit. This is the sharper finding — the fixed baseline hits 48/48 (100%) on its 16 training mazes at a similar exposure count, but the procedural pool's network mostly fails to fit even its *own* 17-maze training set.
+
+The difference is what varies between mazes, not how many there are. The 16 fixed training mazes all share one start-to-goal vector (always `(1,1)` to the opposite corner) and differ only in wall layout, so the network can partly rely on a shared "go down-and-right" direction across all 16. Procedural generation randomizes size *and* start/goal per maze, so each of the 17 pool mazes is a distinct start-to-goal task with no shared direction to exploit — a much harder multi-task problem at the same gradient budget. On top of that, uniformly random start/goal cells are typically much closer together than the fixed suite's opposite-corner placement (mean Manhattan distance on a 10x10 grid is ~5.3 for a random pair versus 14 for opposite corners), so the procedural distribution under-trains exactly the long-path routing the fixed suite tests.
+
+Net finding: naively broadening the training distribution (random size + random start/goal, unchanged episode budget) is not a free win here — it trades a learnable, narrow task for a much harder multi-task one without enough additional training signal to compensate.
+
+### Isolating "random starts alone": `--random-goals`
+
+The procedural result above confounds two changes at once: varying maze size and wall layout, and varying start/goal. `--random-goals` isolates the second: it keeps the same 16 fixed 10x10 wall layouts (so wall-layout diversity is exactly what the original baseline used) and only randomizes the start and goal cell on them, every episode.
+
+```powershell
+.\maze_rl.exe --generalization --episodes 5000 --seeds 3 --seed 1 --random-goals --csv generalization_random_goals.csv
+```
+
+`--random-goals` and `--procedural` are mutually exclusive (the CLI rejects passing both). The held-out suite evaluates each maze at its own fixed, canonical corner-to-corner start/goal regardless of training mode, so a `train` split score below 48/48 here means the network no longer solves the corner-to-corner task on mazes it trained on, only under a different start/goal each time.
+
+| Training regime | Train-set fit (canonical corner task) | All held-out |
+| --- | ---: | ---: |
+| Fixed 16, fixed corners (baseline) — conv | 48/48 | 12/54 (22.2%) |
+| Fixed 16, fixed corners (baseline) — layout MLP | 48/48 | 2/54 (3.7%) |
+| Procedural, fresh maze every episode — conv | 2/48 | 1/54 (1.9%) |
+| Fixed 16 walls, random start/goal — conv | 1/48 | 2/54 (3.7%) |
+| Fixed 16 walls, random start/goal — layout MLP | 9/48 | 2/54 (3.7%) |
+
+This isolates the effect cleanly and revises a conclusion from the convolutional-follow-up result above. With wall-layout diversity held constant at 16 mazes and only start/goal randomized, the convolutional model's held-out advantage over the layout-aware MLP **disappears** (2/54 versus 2/54, both at 3.7%), even though its raw capacity and architecture are unchanged. Since the fixed-corner baseline's convolutional advantage (22.2% vs 3.7%) survived nothing else changing except the maze's start/goal correlation, that advantage looks like it was substantially explained by the convolutional model exploiting the shared "always corner-to-corner" direction across the 16 training mazes more effectively than the MLP did — not by superior maze-solving ability. Neither architecture reaches even 4% held-out once the shared direction is removed. The convolutional inductive bias (spatial weight sharing) may still matter, but this baseline overstated it, and a fair architecture comparison should be run under `--random-goals` or full `--procedural`, not the original fixed-corner setup.
+
+The "random starts alone" claim also does not hold up as a free improvement at this episode budget: it does not beat the fixed-corner baseline for the convolutional model (2/54 vs 12/54) and is roughly a wash for the MLP (2/54 vs 2/54). It is, however, clearly better than fully procedural size+layout+goal randomization (2/54 vs 0-1/54), consistent with the diagnosis that varying every axis at once compounds the sample-efficiency cost. See `EXPERIMENTS.md` and `lessons_learned.md` for the full breakdown and the reasoning behind it.
 
 ### Render the convolutional learning video
 
@@ -155,157 +212,107 @@ One-hot input makes the baseline honest: it gives DQN the same state identity us
 
 ## Summary of mathematical formalisms
 
-Let $s_t$ be the current state, $a_t \in \mathcal{A}$ one of the four actions, $\theta$ the online-network parameters, and $\theta^-$ the target-network parameters.
+Let `s_t` be the current state, `a_t` one of the four actions in the action set, `theta` the online-network parameters, and `theta_target` (written `theta^-` below) the target-network parameters.
 
 ### Epsilon-greedy action selection
 
-Exploration samples an action uniformly:
+Exploration samples an action uniformly; exploitation selects an action with maximum online-network value. The implementation randomly selects among exact maximizing ties:
 
-$$
-a_t \sim \mathrm{Uniform}(\mathcal{A}).
-$$
+```text
+a_t = uniform random action                          if u < epsilon
+a_t = random member of argmax_a Q(s_t, a; theta)      if u >= epsilon
 
-Exploitation selects an action with maximum online-network value:
-
-$$
-a_t \in \underset{a \in \mathcal{A}}{\arg\max}\;Q(s_t,a;\theta).
-$$
-
-The implementation randomly selects among exact maximizing ties. Combining exploration and exploitation gives:
-
-$$
-a_t =
-\begin{cases}
-\text{uniform random action}, & u < \epsilon,\\
-\text{random member of }\arg\max_a Q(s_t,a;\theta), & u \ge \epsilon,
-\end{cases}
-\qquad u \sim \mathrm{Uniform}[0,1).
-$$
+  where u ~ Uniform[0, 1)
+```
 
 ### Bellman optimality target
 
-For replay transition $j$, let $d_j=1$ indicate termination. The fixed target-network value is:
+For replay transition `j`, let `d_j = 1` indicate termination. The fixed target-network value is:
 
-$$
-y_j =
-\begin{cases}
-r_j, & d_j = 1,\\
-r_j + \gamma\displaystyle\max_{a' \in \mathcal{A}}
-Q(s'_j,a';\theta^-), & d_j = 0,
-\end{cases}
-\qquad \gamma = 0.95.
-$$
+```text
+y_j = r_j                                             if d_j = 1
+y_j = r_j + gamma * max_a' Q(s'_j, a'; theta^-)       if d_j = 0
+
+  where gamma = 0.95
+```
 
 The terminal branch deliberately contains no future value because no action occurs after reaching the goal.
 
 ### Minibatch Huber loss
 
-For a uniformly sampled replay minibatch $B$, define the temporal-difference error:
+For a uniformly sampled replay minibatch `B` of size 32, define the temporal-difference error `e_j = y_j - Q(s_j, a_j; theta)`. The implementation uses Huber loss with threshold 1:
 
-$$
-e_j = y_j - Q(s_j,a_j;\theta).
-$$
+```text
+Huber_1(e) = 0.5 * e^2      if |e| <= 1
+Huber_1(e) = |e| - 0.5      if |e| > 1
 
-The implementation uses Huber loss with threshold $1$:
-
-$$
-\mathrm{Huber}_1(e) =
-\begin{cases}
-\tfrac{1}{2}e^2, & |e| \le 1,\\
-|e| - \tfrac{1}{2}, & |e| > 1,
-\end{cases}
-$$
-
-$$
-L(\theta) = \frac{1}{|B|}\sum_{j \in B}
-\mathrm{Huber}_1\!\left(y_j-Q(s_j,a_j;\theta)\right),
-\qquad |B|=32.
-$$
+L(theta) = (1 / |B|) * sum_over_j_in_B( Huber_1(y_j - Q(s_j, a_j; theta)) )
+  where |B| = 32
+```
 
 ### Gradient clipping and optimization
 
-The minibatch gradient is clipped to Euclidean norm $10$, then passed to Adam:
+The minibatch gradient is clipped to Euclidean norm 10, then passed to Adam:
 
-$$
-g = \nabla_\theta L(\theta),
-\qquad
-g_{\mathrm{clipped}} =
-\begin{cases}
-g, & \lVert g\rVert_2 \le 10,\\
-\dfrac{10g}{\lVert g\rVert_2}, & \lVert g\rVert_2 > 10.
-\end{cases}
-$$
+```text
+g = gradient of L(theta) with respect to theta
 
-$$
-\theta \leftarrow
-\mathrm{Adam}\!\left(\theta,g_{\mathrm{clipped}};
-\alpha=10^{-3},\beta_1=0.9,\beta_2=0.999,\varepsilon_{\mathrm{Adam}}=10^{-8}\right).
-$$
+g_clipped = g                       if ||g||_2 <= 10
+g_clipped = 10 * g / ||g||_2        if ||g||_2 > 10
+
+theta <- Adam(theta, g_clipped; alpha=1e-3, beta1=0.9, beta2=0.999, epsilon_adam=1e-8)
+```
 
 ### Periodic target-network copy
 
 The target is held fixed between hard synchronization steps:
 
-$$
-\theta^- \leftarrow \theta
-\qquad \text{every } C=250 \text{ optimizer updates}.
-$$
+```text
+theta^- <- theta      every C = 250 optimizer updates
+```
 
 ### Exploration schedule
 
 After each training episode:
 
-$$
-\epsilon \leftarrow
-\max\!\left(\epsilon_{\min},\epsilon\lambda_\epsilon\right),
-\qquad
-\lambda_\epsilon=0.995,
-\qquad
-\epsilon_{\min}=0.05,
-$$
+```text
+epsilon <- max(epsilon_min, epsilon * lambda_epsilon)
 
-starting from $\epsilon_0=1.0$.
+  lambda_epsilon = 0.995
+  epsilon_min    = 0.05
+  epsilon_0      = 1.0   (starting value)
+```
 
 ### Network equations and tensor dimensions
 
-For one-hot state vector $x(s)\in\mathbb{R}^{100}$:
+For one-hot state vector `x(s)` in `R^100`:
 
-$$
-h = \mathrm{ReLU}(W_1x(s)+b_1),
-\qquad
-Q(s,\cdot;\theta)=W_2h+b_2,
-$$
+```text
+h = ReLU(W1 * x(s) + b1)
+Q(s, .; theta) = W2 * h + b2
 
-with:
+  W1 in R^(64x100),  b1 in R^64,  W2 in R^(4x64),  b2 in R^4
+```
 
-$$
-W_1\in\mathbb{R}^{64\times100},\quad
-b_1\in\mathbb{R}^{64},\quad
-W_2\in\mathbb{R}^{4\times64},\quad
-b_2\in\mathbb{R}^{4}.
-$$
+Therefore the online network contains exactly:
 
-Therefore the online network contains exactly
-
-$$
-(64\times100)+64+(4\times64)+4
-=6{,}724.
-$$
+```text
+(64 * 100) + 64 + (4 * 64) + 4 = 6,724
+```
 
 Thus, the online network has **6,724 trainable parameters**.
 
-Weights use He initialization with variance $2/n_{\mathrm{in}}$:
+Weights use He initialization with variance `2 / n_in`:
 
-$$
-W_{ij} \sim \mathcal{N}\!\left(0,\frac{2}{n_{\mathrm{in}}}\right).
-$$
+```text
+W_ij ~ Normal(0, 2 / n_in)
+```
 
-After the online weights are initialized, the target network begins as an exact
-copy of the online network:
+After the online weights are initialized, the target network begins as an exact copy of the online network:
 
-$$
-\theta^- \leftarrow \theta.
-$$
+```text
+theta^- <- theta
+```
 
 ## Tests
 
