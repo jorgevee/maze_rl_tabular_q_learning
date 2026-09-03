@@ -45,6 +45,7 @@ generalization.csv
 generalization_procedural.csv
 generalization_procedural_pool.csv
 generalization_random_goals.csv
+generalization_random_goals_20k.csv
 # CLion / JetBrains
 .idea/
 
