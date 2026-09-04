@@ -126,6 +126,7 @@ typedef struct {
     int proceduralMaxSize;
     int proceduralRegenEvery;
     bool randomGoals;
+    int randomGoalsMinSeparation;
 } GenOptions;
 
 typedef struct {
@@ -289,14 +290,22 @@ static int CollectOpenInteriorCells(const ExperimentMaze *maze, int cells[GEN_MA
 /* Isolates the "random starts" claim from procedural generation: keeps a
    fixed maze's wall layout exactly as generated, and only swaps in a random
    pair of open cells as start/goal, subject to the same minimum-distance
-   rejection sampling as GenerateProceduralMaze. Falls back to the maze's own
-   canonical start/goal if no open pair is ever reachable (should not happen
-   for a validated, connected maze, but the fixed suite is untouched here so
-   this is defensive rather than load-bearing). */
+   rejection sampling as GenerateProceduralMaze. `minSeparation` additionally
+   rejects any candidate pair whose Manhattan distance falls short of it,
+   biasing the sampled start/goal toward longer routes so the training
+   distribution stops under-sampling the long corner-to-corner case the
+   held-out suite always tests (0 disables this and reproduces the original
+   uniform-random behavior exactly). Falls back to the maze's own canonical
+   start/goal if no qualifying open pair is ever found (should not happen
+   for a validated, connected maze at minSeparation 0, but the fixed suite is
+   untouched here so this is defensive rather than load-bearing; at a high
+   minSeparation on a small maze, this fallback is the expected outcome and
+   itself a maximally-separated pair). */
 static void RandomizeStartGoal(
     const ExperimentMaze *maze,
     int *startState,
     int *goalState,
+    int minSeparation,
     Rng *rng)
 {
     int open[GEN_MAX_CELLS];
@@ -311,6 +320,9 @@ static void RandomizeStartGoal(
         if (a == b) continue;
         int candidateStart = open[a];
         int candidateGoal = open[b];
+        int manhattan = abs(StateX(candidateGoal) - StateX(candidateStart)) +
+            abs(StateY(candidateGoal) - StateY(candidateStart));
+        if (manhattan < minSeparation) continue;
         int distance = ShortestPathGeneric(
             maze->width, maze->height, maze->wall, candidateStart, candidateGoal);
         if (distance > bestDistance) {
@@ -318,8 +330,6 @@ static void RandomizeStartGoal(
             bestStart = candidateStart;
             bestGoal = candidateGoal;
         }
-        int manhattan = abs(StateX(candidateGoal) - StateX(candidateStart)) +
-            abs(StateY(candidateGoal) - StateY(candidateStart));
         if (distance >= manhattan + 2) {
             *startState = candidateStart;
             *goalState = candidateGoal;
@@ -939,7 +949,7 @@ static GenEpisode RunEpisode(
 
 static GenOptions DefaultOptions(void)
 {
-    return (GenOptions){5000, 3, 1, "generalization.csv", false, 6, 12, 1, false};
+    return (GenOptions){5000, 3, 1, "generalization.csv", false, 6, 12, 1, false, 0};
 }
 
 static bool ParsePositive(const char *text, int *value)
@@ -947,6 +957,15 @@ static bool ParsePositive(const char *text, int *value)
     char *end = NULL;
     long parsed = strtol(text, &end, 10);
     if (end == text || *end != '\0' || parsed < 1 || parsed > 1000000) return false;
+    *value = (int)parsed;
+    return true;
+}
+
+static bool ParseNonNegative(const char *text, int *value)
+{
+    char *end = NULL;
+    long parsed = strtol(text, &end, 10);
+    if (end == text || *end != '\0' || parsed < 0 || parsed > 1000000) return false;
     *value = (int)parsed;
     return true;
 }
@@ -975,12 +994,15 @@ static bool ParseOptions(int argc, char **argv, GenOptions *options)
             if (!ParsePositive(argv[++i], &options->proceduralRegenEvery)) return false;
         } else if (strcmp(argv[i], "--random-goals") == 0) {
             options->randomGoals = true;
+        } else if (strcmp(argv[i], "--min-separation") == 0 && i + 1 < argc) {
+            if (!ParseNonNegative(argv[++i], &options->randomGoalsMinSeparation)) return false;
         } else return false;
     }
     if (options->proceduralMinSize < 3 || options->proceduralMaxSize > GEN_MAX_SIZE ||
         options->proceduralMinSize > options->proceduralMaxSize)
         return false;
     if (options->procedural && options->randomGoals) return false;
+    if (options->randomGoalsMinSeparation > 0 && !options->randomGoals) return false;
     return true;
 }
 
@@ -1166,7 +1188,12 @@ static int RunOne(
         snprintf(trainMode, sizeof(trainMode), "procedural_%dto%d",
             options->proceduralMinSize, options->proceduralMaxSize);
     } else if (options->randomGoals) {
-        snprintf(trainMode, sizeof(trainMode), "fixed_%d_random_goals", GEN_TRAIN_MAZES);
+        if (options->randomGoalsMinSeparation > 0) {
+            snprintf(trainMode, sizeof(trainMode), "fixed_%d_random_goals_sep%d",
+                GEN_TRAIN_MAZES, options->randomGoalsMinSeparation);
+        } else {
+            snprintf(trainMode, sizeof(trainMode), "fixed_%d_random_goals", GEN_TRAIN_MAZES);
+        }
     } else {
         snprintf(trainMode, sizeof(trainMode), "fixed_%d", GEN_TRAIN_MAZES);
     }
@@ -1198,7 +1225,8 @@ static int RunOne(
             GenMazeView trainMaze = ViewOfMaze(&mazes[mazeIndex]);
             int randomStart;
             int randomGoal;
-            RandomizeStartGoal(&mazes[mazeIndex], &randomStart, &randomGoal, &rng);
+            RandomizeStartGoal(&mazes[mazeIndex], &randomStart, &randomGoal,
+                options->randomGoalsMinSeparation, &rng);
             trainMaze.goalState = randomGoal;
             if (poolCount < GEN_POOL_CAP) {
                 poolMazes[poolCount] = trainMaze;
@@ -1277,7 +1305,8 @@ int RunGeneralizationExperiment(int argc, char **argv)
     GenOptions options;
     if (!ParseOptions(argc, argv, &options)) {
         fprintf(stderr, "Usage: %s --generalization [--episodes N] [--seeds N] [--seed N] [--csv FILE] "
-            "[--procedural] [--min-size N] [--max-size N] [--regen-every N] [--random-goals]\n", argv[0]);
+            "[--procedural] [--min-size N] [--max-size N] [--regen-every N] "
+            "[--random-goals [--min-separation N]]\n", argv[0]);
         return 2;
     }
     ExperimentMaze mazes[GEN_MAZE_COUNT];

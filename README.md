@@ -173,6 +173,27 @@ The "random starts alone" claim also does not hold up as a free improvement at t
 
 **Follow-up: is 5,000 episodes just not enough for this harder distribution?** Running `--random-goals` at 20,000 episodes (4x budget, same seeds) answers this directly: train-set fit and pool fit both improved substantially for both architectures (conv train-fit 2.1% to 12.5%, layout 18.8% to 27.1%), but held-out success did not move at all — 2/54 to 2/54 for both. More budget makes the network measurably better at the distribution it's trained on; that improvement does not transfer to the fixed corner-to-corner benchmark. This rules out pure underfitting as the explanation and reinforces the distribution-mismatch diagnosis instead: the fix is a training distribution that doesn't under-sample long routes, not simply more of the same training.
 
+**Fixing the mismatch directly: `--min-separation N`.** This adds a minimum-Manhattan-distance filter to the random start/goal sampling above, biasing it toward routes closer to the training mazes' own corner-to-corner distance (14, for the 10x10 training set) instead of the short hops uniform sampling tends to produce.
+
+```powershell
+.\maze_rl.exe --generalization --episodes 5000 --seeds 3 --seed 1 --random-goals --min-separation 10 --csv generalization_random_goals_sep10.csv
+```
+
+At the *same* 5,000-episode budget as the original negative result (a quarter of the 20,000-episode budget test above), `--min-separation 10` improved every metric — but the first pass at this used only 3 seeds, and one seed turned out to be doing most of the work. Re-run at 10 seeds each (1,800 held-out evaluations total per config instead of 540) before trusting it:
+
+| Metric | `--random-goals`, min-sep=0 | `--random-goals`, min-sep=10 |
+| --- | ---: | ---: |
+| conv train-fit | 12/160 (7.5%) | 41/160 (25.6%) |
+| layout train-fit | 28/160 (17.5%) | 82/160 (51.3%) |
+| conv pool-fit | 672/2560 (26.3%) | 695/2560 (27.1%) |
+| layout pool-fit | 903/2560 (35.3%) | 1110/2560 (43.4%) |
+| conv all-unseen | 7/180 (3.9%) | 9/180 (5.0%) |
+| layout all-unseen | 7/180 (3.9%) | 18/180 (10.0%) |
+
+At 10 seeds, the two architectures start **identical** on the unbiased baseline (3.9% each) — the earlier 3-seed run's "layout already ahead of conv" reading doesn't hold up. The separation fix still helps both, but unevenly: the MLP's held-out score roughly doubles from a real signal spread across most seeds (successes in 8 of 10 seeds, not one outlier), while the convolutional model's improvement is smaller and closer to the edge of what 10 seeds can distinguish from noise. The originally reported 13.0% for the MLP was inflated by a single seed and should be read as 10.0%.
+
+The training-fit numbers are the more interesting thread: the MLP fits its own training distribution roughly 2x better than the convolutional model in *both* conditions (17.5% vs 7.5% unbiased; 51.3% vs 25.6% biased), not just the biased one. That consistency across two different training distributions points at something structural rather than a fluke of one run: the convolutional model compresses its two 13x13 input planes down to a 5x5x8 feature map (via a stride-2 second layer) before the goal-displacement values are mixed in, while the MLP's single dense layer combines every raw input pixel with the displacement values directly and without that spatial bottleneck. That compression was a good trade when the task had one shared, easy-to-represent start-to-goal direction (weight sharing paid for itself at the 22.2% original baseline with 38% fewer parameters). It looks like a worse trade once the task requires distinguishing many different goal directions and distances per maze — exactly the regime `--random-goals` puts both models in. This is a plausible mechanism, not a proven one; no ablation (e.g. a wider convolutional stack, or a parameter-matched MLP) has isolated capacity from inductive bias as the actual cause yet.
+
 See `EXPERIMENTS.md` and `lessons_learned.md` for the full breakdown and the reasoning behind it.
 
 ### Render the convolutional learning video
