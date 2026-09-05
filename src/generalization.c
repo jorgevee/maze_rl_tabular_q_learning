@@ -37,6 +37,17 @@
 #define GEN_CONV2_SIDE ((GEN_CONV1_SIDE - GEN_CONV_KERNEL) / GEN_CONV2_STRIDE + 1)
 #define GEN_CONV2_COUNT (GEN_CONV2_FILTERS * GEN_CONV2_SIDE * GEN_CONV2_SIDE)
 #define GEN_CONV_DENSE_INPUT (GEN_CONV2_COUNT + 2)
+/* Parameter-matched architecture ablation: same conv1 -> conv2 -> dense -> output
+   shape as the standard convolutional model, but with a wider second conv
+   layer (13 filters instead of 8) so total parameter count (21,809) lands
+   close to the layout-aware MLP's 22,084, instead of the standard conv
+   model's 13,624. Everything else (kernel size, stride, conv1 width, dense
+   width) is identical, so a performance difference here isolates capacity
+   from the standard model's architecture, without touching kernel/stride/
+   depth choices that would also change its inductive bias. */
+#define GEN_WIDE_CONV2_FILTERS 13
+#define GEN_WIDE_CONV2_COUNT (GEN_WIDE_CONV2_FILTERS * GEN_CONV2_SIDE * GEN_CONV2_SIDE)
+#define GEN_WIDE_CONV_DENSE_INPUT (GEN_WIDE_CONV2_COUNT + 2)
 #define GEN_VIDEO_MAZES 4
 #define GEN_VIDEO_MAX_CHECKPOINTS 6
 #define GEN_VIDEO_DEFAULT_FPS 30
@@ -47,7 +58,8 @@
 typedef enum {
     OBS_POSITION,
     OBS_LAYOUT,
-    OBS_CONV
+    OBS_CONV,
+    OBS_CONV_WIDE
 } ObservationKind;
 
 typedef struct {
@@ -106,6 +118,7 @@ typedef struct {
     float input[GEN_MAX_INPUT];
     float conv1[GEN_CONV1_COUNT];
     float conv2[GEN_CONV2_COUNT];
+    float wideConv2[GEN_WIDE_CONV2_COUNT];
     float hidden[GEN_MAX_HIDDEN];
     float values[GEN_ACTIONS];
 } GenForward;
@@ -127,6 +140,7 @@ typedef struct {
     int proceduralRegenEvery;
     bool randomGoals;
     int randomGoalsMinSeparation;
+    bool wideConv;
 } GenOptions;
 
 typedef struct {
@@ -446,6 +460,34 @@ static int ConvOutputBiasesOffset(void)
 }
 static int ConvParameterCount(void) { return ConvOutputBiasesOffset() + GEN_ACTIONS; }
 
+/* Wide-conv parameter layout. Conv1 has the same shape as the standard
+   convolutional model, so its offsets are identical and reused directly
+   (WideConv1WeightsOffset/WideConv1BiasesOffset would just be
+   Conv1WeightsOffset/Conv1BiasesOffset). Only conv2 onward differs. */
+static int WideConv2WeightsOffset(void) { return Conv2WeightsOffset(); }
+static int WideConv2BiasesOffset(void)
+{
+    return WideConv2WeightsOffset() +
+        GEN_WIDE_CONV2_FILTERS * GEN_CONV1_FILTERS * GEN_CONV_KERNEL * GEN_CONV_KERNEL;
+}
+static int WideConvDenseWeightsOffset(void)
+{
+    return WideConv2BiasesOffset() + GEN_WIDE_CONV2_FILTERS;
+}
+static int WideConvDenseBiasesOffset(void)
+{
+    return WideConvDenseWeightsOffset() + GEN_MAX_HIDDEN * GEN_WIDE_CONV_DENSE_INPUT;
+}
+static int WideConvOutputWeightsOffset(void)
+{
+    return WideConvDenseBiasesOffset() + GEN_MAX_HIDDEN;
+}
+static int WideConvOutputBiasesOffset(void)
+{
+    return WideConvOutputWeightsOffset() + GEN_ACTIONS * GEN_MAX_HIDDEN;
+}
+static int WideConvParameterCount(void) { return WideConvOutputBiasesOffset() + GEN_ACTIONS; }
+
 static void Encode(
     const GenDqn *dqn,
     const GenMazeView *maze,
@@ -503,7 +545,9 @@ static void ForwardMlp(
     }
 }
 
-static void ForwardConv(const float *parameters, GenForward *cache)
+/* Conv1 is identical in shape (and offsets) between the standard and
+   wide-conv models, so both call this same stage. */
+static void ForwardConv1Stage(const float *parameters, GenForward *cache)
 {
     int c1w = Conv1WeightsOffset();
     int c1b = Conv1BiasesOffset();
@@ -528,6 +572,11 @@ static void ForwardConv(const float *parameters, GenForward *cache)
             }
         }
     }
+}
+
+static void ForwardConv(const float *parameters, GenForward *cache)
+{
+    ForwardConv1Stage(parameters, cache);
 
     int c2w = Conv2WeightsOffset();
     int c2b = Conv2BiasesOffset();
@@ -580,6 +629,64 @@ static void ForwardConv(const float *parameters, GenForward *cache)
     }
 }
 
+/* Parameter-matched ablation: identical to ForwardConv except conv2 has
+   GEN_WIDE_CONV2_FILTERS channels instead of GEN_CONV2_FILTERS, writing
+   into cache->wideConv2 instead of cache->conv2. */
+static void ForwardConvWide(const float *parameters, GenForward *cache)
+{
+    ForwardConv1Stage(parameters, cache);
+
+    int c2w = WideConv2WeightsOffset();
+    int c2b = WideConv2BiasesOffset();
+    for (int filter = 0; filter < GEN_WIDE_CONV2_FILTERS; filter++) {
+        for (int y = 0; y < GEN_CONV2_SIDE; y++) {
+            for (int x = 0; x < GEN_CONV2_SIDE; x++) {
+                float value = parameters[c2b + filter];
+                for (int channel = 0; channel < GEN_CONV1_FILTERS; channel++) {
+                    for (int ky = 0; ky < GEN_CONV_KERNEL; ky++) {
+                        for (int kx = 0; kx < GEN_CONV_KERNEL; kx++) {
+                            int inputY = y * GEN_CONV2_STRIDE + ky;
+                            int inputX = x * GEN_CONV2_STRIDE + kx;
+                            int inputIndex = (channel * GEN_CONV1_SIDE + inputY) *
+                                GEN_CONV1_SIDE + inputX;
+                            int weightIndex = c2w +
+                                ((filter * GEN_CONV1_FILTERS + channel) * GEN_CONV_KERNEL + ky) *
+                                GEN_CONV_KERNEL + kx;
+                            value += parameters[weightIndex] * cache->conv1[inputIndex];
+                        }
+                    }
+                }
+                int outputIndex = (filter * GEN_CONV2_SIDE + y) * GEN_CONV2_SIDE + x;
+                cache->wideConv2[outputIndex] = value > 0.0f ? value : 0.0f;
+            }
+        }
+    }
+
+    int denseWeights = WideConvDenseWeightsOffset();
+    int denseBiases = WideConvDenseBiasesOffset();
+    for (int h = 0; h < GEN_MAX_HIDDEN; h++) {
+        float value = parameters[denseBiases + h];
+        int row = denseWeights + h * GEN_WIDE_CONV_DENSE_INPUT;
+        for (int i = 0; i < GEN_WIDE_CONV2_COUNT; i++)
+            value += parameters[row + i] * cache->wideConv2[i];
+        value += parameters[row + GEN_WIDE_CONV2_COUNT] *
+            cache->input[2 * GEN_CROP_SIDE * GEN_CROP_SIDE];
+        value += parameters[row + GEN_WIDE_CONV2_COUNT + 1] *
+            cache->input[2 * GEN_CROP_SIDE * GEN_CROP_SIDE + 1];
+        cache->hidden[h] = value > 0.0f ? value : 0.0f;
+    }
+
+    int outputWeights = WideConvOutputWeightsOffset();
+    int outputBiases = WideConvOutputBiasesOffset();
+    for (int action = 0; action < GEN_ACTIONS; action++) {
+        float value = parameters[outputBiases + action];
+        int row = outputWeights + action * GEN_MAX_HIDDEN;
+        for (int h = 0; h < GEN_MAX_HIDDEN; h++)
+            value += parameters[row + h] * cache->hidden[h];
+        cache->values[action] = value;
+    }
+}
+
 static void ForwardState(
     const GenDqn *dqn,
     const float *parameters,
@@ -589,6 +696,7 @@ static void ForwardState(
 {
     Encode(dqn, maze, state, cache->input);
     if (dqn->observation == OBS_CONV) ForwardConv(parameters, cache);
+    else if (dqn->observation == OBS_CONV_WIDE) ForwardConvWide(parameters, cache);
     else ForwardMlp(dqn, parameters, cache);
 }
 
@@ -601,8 +709,9 @@ static bool InitializeDqn(
     dqn->observation = observation;
     dqn->inputSize = observation == OBS_POSITION ? GEN_POSITION_INPUT : GEN_LAYOUT_INPUT;
     dqn->hiddenSize = observation == OBS_POSITION ? 32 : 64;
-    dqn->parameterCount = observation == OBS_CONV ?
-        ConvParameterCount() : MlpParameterCount(dqn->inputSize, dqn->hiddenSize);
+    dqn->parameterCount = observation == OBS_CONV ? ConvParameterCount() :
+        observation == OBS_CONV_WIDE ? WideConvParameterCount() :
+        MlpParameterCount(dqn->inputSize, dqn->hiddenSize);
     size_t bytes = sizeof(float) * (size_t)dqn->parameterCount;
     dqn->online = malloc(bytes);
     dqn->target = malloc(bytes);
@@ -626,6 +735,24 @@ static bool InitializeDqn(
         for (int i = ConvDenseWeightsOffset(); i < ConvDenseBiasesOffset(); i++)
             dqn->online[i] = RngNormal(rng) * denseScale;
         for (int i = ConvOutputWeightsOffset(); i < ConvOutputBiasesOffset(); i++)
+            dqn->online[i] = RngNormal(rng) * outputScale;
+    } else if (observation == OBS_CONV_WIDE) {
+        /* c1Scale/c2Scale depend only on fan-in (input channels x kernel
+           area), which is unchanged from the standard conv model, so they
+           are identical here. Only denseScale changes, since it depends on
+           the wider flattened conv2 output feeding the dense layer. */
+        float c1Scale = sqrtf(2.0f / (2 * GEN_CONV_KERNEL * GEN_CONV_KERNEL));
+        float c2Scale = sqrtf(2.0f /
+            (GEN_CONV1_FILTERS * GEN_CONV_KERNEL * GEN_CONV_KERNEL));
+        float denseScale = sqrtf(2.0f / GEN_WIDE_CONV_DENSE_INPUT);
+        float outputScale = sqrtf(2.0f / GEN_MAX_HIDDEN);
+        for (int i = Conv1WeightsOffset(); i < Conv1BiasesOffset(); i++)
+            dqn->online[i] = RngNormal(rng) * c1Scale;
+        for (int i = WideConv2WeightsOffset(); i < WideConv2BiasesOffset(); i++)
+            dqn->online[i] = RngNormal(rng) * c2Scale;
+        for (int i = WideConvDenseWeightsOffset(); i < WideConvDenseBiasesOffset(); i++)
+            dqn->online[i] = RngNormal(rng) * denseScale;
+        for (int i = WideConvOutputWeightsOffset(); i < WideConvOutputBiasesOffset(); i++)
             dqn->online[i] = RngNormal(rng) * outputScale;
     } else {
         int b1 = MlpB1Offset(dqn);
@@ -736,6 +863,39 @@ static void AccumulateMlpGradient(
     }
 }
 
+/* Conv1's backward pass is identical in shape/offsets between the standard
+   and wide-conv models; both call this with their own upstream gradient. */
+static void AccumulateConv1Gradient(
+    GenDqn *dqn,
+    const GenForward *cache,
+    const float conv1Gradient[GEN_CONV1_COUNT])
+{
+    int c1w = Conv1WeightsOffset();
+    int c1b = Conv1BiasesOffset();
+    for (int filter = 0; filter < GEN_CONV1_FILTERS; filter++) {
+        for (int y = 0; y < GEN_CONV1_SIDE; y++) {
+            for (int x = 0; x < GEN_CONV1_SIDE; x++) {
+                int outputIndex = (filter * GEN_CONV1_SIDE + y) * GEN_CONV1_SIDE + x;
+                if (cache->conv1[outputIndex] <= 0.0f) continue;
+                float gradient = conv1Gradient[outputIndex];
+                dqn->gradient[c1b + filter] += gradient;
+                for (int channel = 0; channel < 2; channel++) {
+                    for (int ky = 0; ky < GEN_CONV_KERNEL; ky++) {
+                        for (int kx = 0; kx < GEN_CONV_KERNEL; kx++) {
+                            int inputIndex = channel * GEN_CROP_SIDE * GEN_CROP_SIDE +
+                                (y + ky) * GEN_CROP_SIDE + x + kx;
+                            int weightIndex = c1w +
+                                ((filter * 2 + channel) * GEN_CONV_KERNEL + ky) *
+                                GEN_CONV_KERNEL + kx;
+                            dqn->gradient[weightIndex] += gradient * cache->input[inputIndex];
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 static void AccumulateConvGradient(
     GenDqn *dqn,
     const GenForward *cache,
@@ -801,30 +961,78 @@ static void AccumulateConvGradient(
         }
     }
 
-    int c1w = Conv1WeightsOffset();
-    int c1b = Conv1BiasesOffset();
-    for (int filter = 0; filter < GEN_CONV1_FILTERS; filter++) {
-        for (int y = 0; y < GEN_CONV1_SIDE; y++) {
-            for (int x = 0; x < GEN_CONV1_SIDE; x++) {
-                int outputIndex = (filter * GEN_CONV1_SIDE + y) * GEN_CONV1_SIDE + x;
-                if (cache->conv1[outputIndex] <= 0.0f) continue;
-                float gradient = conv1Gradient[outputIndex];
-                dqn->gradient[c1b + filter] += gradient;
-                for (int channel = 0; channel < 2; channel++) {
+    AccumulateConv1Gradient(dqn, cache, conv1Gradient);
+}
+
+/* Parameter-matched ablation: identical structure to AccumulateConvGradient
+   except conv2 has GEN_WIDE_CONV2_FILTERS channels, reads cache->wideConv2,
+   and uses the Wide* offset functions. */
+static void AccumulateConvWideGradient(
+    GenDqn *dqn,
+    const GenForward *cache,
+    Action action,
+    float outputGradient)
+{
+    float hiddenGradient[GEN_MAX_HIDDEN] = {0};
+    float conv2Gradient[GEN_WIDE_CONV2_COUNT] = {0};
+    float conv1Gradient[GEN_CONV1_COUNT] = {0};
+    int outputWeights = WideConvOutputWeightsOffset();
+    int outputBiases = WideConvOutputBiasesOffset();
+    int outputRow = outputWeights + action * GEN_MAX_HIDDEN;
+    dqn->gradient[outputBiases + action] += outputGradient;
+    for (int h = 0; h < GEN_MAX_HIDDEN; h++) {
+        dqn->gradient[outputRow + h] += outputGradient * cache->hidden[h];
+        if (cache->hidden[h] > 0.0f)
+            hiddenGradient[h] = outputGradient * dqn->online[outputRow + h];
+    }
+
+    int denseWeights = WideConvDenseWeightsOffset();
+    int denseBiases = WideConvDenseBiasesOffset();
+    int displacement = 2 * GEN_CROP_SIDE * GEN_CROP_SIDE;
+    for (int h = 0; h < GEN_MAX_HIDDEN; h++) {
+        float hiddenGrad = hiddenGradient[h];
+        if (hiddenGrad == 0.0f) continue;
+        dqn->gradient[denseBiases + h] += hiddenGrad;
+        int row = denseWeights + h * GEN_WIDE_CONV_DENSE_INPUT;
+        for (int i = 0; i < GEN_WIDE_CONV2_COUNT; i++) {
+            dqn->gradient[row + i] += hiddenGrad * cache->wideConv2[i];
+            conv2Gradient[i] += hiddenGrad * dqn->online[row + i];
+        }
+        dqn->gradient[row + GEN_WIDE_CONV2_COUNT] +=
+            hiddenGrad * cache->input[displacement];
+        dqn->gradient[row + GEN_WIDE_CONV2_COUNT + 1] +=
+            hiddenGrad * cache->input[displacement + 1];
+    }
+
+    int c2w = WideConv2WeightsOffset();
+    int c2b = WideConv2BiasesOffset();
+    for (int filter = 0; filter < GEN_WIDE_CONV2_FILTERS; filter++) {
+        for (int y = 0; y < GEN_CONV2_SIDE; y++) {
+            for (int x = 0; x < GEN_CONV2_SIDE; x++) {
+                int outputIndex = (filter * GEN_CONV2_SIDE + y) * GEN_CONV2_SIDE + x;
+                if (cache->wideConv2[outputIndex] <= 0.0f) continue;
+                float gradient = conv2Gradient[outputIndex];
+                dqn->gradient[c2b + filter] += gradient;
+                for (int channel = 0; channel < GEN_CONV1_FILTERS; channel++) {
                     for (int ky = 0; ky < GEN_CONV_KERNEL; ky++) {
                         for (int kx = 0; kx < GEN_CONV_KERNEL; kx++) {
-                            int inputIndex = channel * GEN_CROP_SIDE * GEN_CROP_SIDE +
-                                (y + ky) * GEN_CROP_SIDE + x + kx;
-                            int weightIndex = c1w +
-                                ((filter * 2 + channel) * GEN_CONV_KERNEL + ky) *
+                            int inputY = y * GEN_CONV2_STRIDE + ky;
+                            int inputX = x * GEN_CONV2_STRIDE + kx;
+                            int inputIndex = (channel * GEN_CONV1_SIDE + inputY) *
+                                GEN_CONV1_SIDE + inputX;
+                            int weightIndex = c2w +
+                                ((filter * GEN_CONV1_FILTERS + channel) * GEN_CONV_KERNEL + ky) *
                                 GEN_CONV_KERNEL + kx;
-                            dqn->gradient[weightIndex] += gradient * cache->input[inputIndex];
+                            dqn->gradient[weightIndex] += gradient * cache->conv1[inputIndex];
+                            conv1Gradient[inputIndex] += gradient * dqn->online[weightIndex];
                         }
                     }
                 }
             }
         }
     }
+
+    AccumulateConv1Gradient(dqn, cache, conv1Gradient);
 }
 
 static void TrainBatch(GenDqn *dqn, Rng *rng)
@@ -848,6 +1056,8 @@ static void TrainBatch(GenDqn *dqn, Rng *rng)
             GEN_BATCH_SIZE;
         if (dqn->observation == OBS_CONV)
             AccumulateConvGradient(dqn, &current, transition.action, outputGradient);
+        else if (dqn->observation == OBS_CONV_WIDE)
+            AccumulateConvWideGradient(dqn, &current, transition.action, outputGradient);
         else AccumulateMlpGradient(dqn, &current, transition.action, outputGradient);
     }
 
@@ -920,6 +1130,58 @@ static bool ConvGradientSelfTest(const ExperimentMaze mazes[GEN_MAZE_COUNT])
     return passed;
 }
 
+/* Mirrors ConvGradientSelfTest, but checks a weight inside the widened
+   conv2 layer specifically, since that (and its backward pass) is the new
+   code path introduced for the parameter-matched architecture ablation. */
+static bool WideConvGradientSelfTest(const ExperimentMaze mazes[GEN_MAZE_COUNT])
+{
+    Rng rng;
+    RngSeed(&rng, UINT64_C(0x87654321));
+    GenDqn dqn;
+    if (!InitializeDqn(&dqn, OBS_CONV_WIDE, &rng)) {
+        DestroyDqn(&dqn);
+        return false;
+    }
+    GenMazeView maze = ViewOfMaze(&mazes[0]);
+    GenForward cache;
+    ForwardState(&dqn, dqn.online, &maze, mazes[0].startState, &cache);
+    const Action action = ACTION_DOWN;
+    const float target = cache.values[action] - 0.25f;
+    memset(dqn.gradient, 0, sizeof(float) * (size_t)dqn.parameterCount);
+    AccumulateConvWideGradient(&dqn, &cache, action, cache.values[action] - target);
+
+    int parameter = -1;
+    for (int i = WideConv2WeightsOffset(); i < WideConv2BiasesOffset(); i++) {
+        if (fabsf(dqn.gradient[i]) > 1.0e-5f) {
+            parameter = i;
+            break;
+        }
+    }
+    if (parameter < 0) {
+        DestroyDqn(&dqn);
+        return false;
+    }
+
+    const float epsilon = 1.0e-3f;
+    float original = dqn.online[parameter];
+    dqn.online[parameter] = original + epsilon;
+    GenForward plus;
+    ForwardState(&dqn, dqn.online, &maze, mazes[0].startState, &plus);
+    float plusError = plus.values[action] - target;
+    float plusLoss = 0.5f * plusError * plusError;
+    dqn.online[parameter] = original - epsilon;
+    GenForward minus;
+    ForwardState(&dqn, dqn.online, &maze, mazes[0].startState, &minus);
+    float minusError = minus.values[action] - target;
+    float minusLoss = 0.5f * minusError * minusError;
+    dqn.online[parameter] = original;
+    float numerical = (plusLoss - minusLoss) / (2.0f * epsilon);
+    float analytic = dqn.gradient[parameter];
+    bool passed = fabsf(numerical - analytic) < 2.0e-3f;
+    DestroyDqn(&dqn);
+    return passed;
+}
+
 static GenEpisode RunEpisode(
     GenDqn *dqn,
     const GenMazeView *maze,
@@ -949,7 +1211,7 @@ static GenEpisode RunEpisode(
 
 static GenOptions DefaultOptions(void)
 {
-    return (GenOptions){5000, 3, 1, "generalization.csv", false, 6, 12, 1, false, 0};
+    return (GenOptions){5000, 3, 1, "generalization.csv", false, 6, 12, 1, false, 0, false};
 }
 
 static bool ParsePositive(const char *text, int *value)
@@ -996,6 +1258,8 @@ static bool ParseOptions(int argc, char **argv, GenOptions *options)
             options->randomGoals = true;
         } else if (strcmp(argv[i], "--min-separation") == 0 && i + 1 < argc) {
             if (!ParseNonNegative(argv[++i], &options->randomGoalsMinSeparation)) return false;
+        } else if (strcmp(argv[i], "--wide-conv") == 0) {
+            options->wideConv = true;
         } else return false;
     }
     if (options->proceduralMinSize < 3 || options->proceduralMaxSize > GEN_MAX_SIZE ||
@@ -1166,6 +1430,7 @@ static bool CaptureVideoCheckpoints(
 static const char *ObservationName(ObservationKind kind)
 {
     if (kind == OBS_CONV) return "conv_layout";
+    if (kind == OBS_CONV_WIDE) return "conv_wide_layout";
     return kind == OBS_LAYOUT ? "layout_aware" : "position_only";
 }
 
@@ -1306,7 +1571,7 @@ int RunGeneralizationExperiment(int argc, char **argv)
     if (!ParseOptions(argc, argv, &options)) {
         fprintf(stderr, "Usage: %s --generalization [--episodes N] [--seeds N] [--seed N] [--csv FILE] "
             "[--procedural] [--min-size N] [--max-size N] [--regen-every N] "
-            "[--random-goals [--min-separation N]]\n", argv[0]);
+            "[--random-goals [--min-separation N]] [--wide-conv]\n", argv[0]);
         return 2;
     }
     ExperimentMaze mazes[GEN_MAZE_COUNT];
@@ -1329,6 +1594,8 @@ int RunGeneralizationExperiment(int argc, char **argv)
         status = RunOne(csv, mazes, OBS_POSITION, &options, seed);
         if (status == 0) status = RunOne(csv, mazes, OBS_LAYOUT, &options, seed);
         if (status == 0) status = RunOne(csv, mazes, OBS_CONV, &options, seed);
+        if (status == 0 && options.wideConv)
+            status = RunOne(csv, mazes, OBS_CONV_WIDE, &options, seed);
         fflush(csv);
     }
     fclose(csv);
@@ -1667,9 +1934,11 @@ bool GeneralizationRunSelfTests(void)
     if (wall.nextState != mazes[0].startState || wall.reward != -5.0f || wall.done)
         return false;
     if (GEN_LAYOUT_INPUT != 340 || MlpParameterCount(GEN_LAYOUT_INPUT, 64) != 22084 ||
-        GEN_CONV1_SIDE != 11 || GEN_CONV2_SIDE != 5 || ConvParameterCount() != 13624)
+        GEN_CONV1_SIDE != 11 || GEN_CONV2_SIDE != 5 || ConvParameterCount() != 13624 ||
+        WideConvParameterCount() != 21809)
         return false;
     if (!ConvGradientSelfTest(mazes)) return false;
+    if (!WideConvGradientSelfTest(mazes)) return false;
 
     Rng proceduralRng;
     RngSeed(&proceduralRng, UINT64_C(0x9e3779b97f4a7c15));

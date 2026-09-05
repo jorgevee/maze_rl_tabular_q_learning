@@ -20,7 +20,7 @@ CPPFLAGS := -I$(RAYLIB_INCLUDE) -Isrc
 
 SOURCES := $(wildcard src/*.c)
 LIB_SOURCES := $(filter-out src/main.c src/benchmark.c,$(SOURCES))
-.PHONY: all benchmark generalization generalization-procedural generalization-random-goals generalization-random-goals-sep10 video test clean
+.PHONY: all benchmark generalization generalization-procedural generalization-random-goals generalization-random-goals-sep10 generalization-wide-conv generalization-sep-sweep video test clean
 
 all: $(TARGET)
 
@@ -50,6 +50,16 @@ generalization-random-goals: $(TARGET)
 generalization-random-goals-sep10: $(TARGET)
 	./$(TARGET) --generalization --episodes 5000 --seeds 3 --seed 1 --random-goals \
 		--min-separation 10 --csv generalization_random_goals_sep10.csv
+
+generalization-wide-conv: $(TARGET)
+	./$(TARGET) --generalization --episodes 5000 --seeds 10 --seed 1 --random-goals \
+		--min-separation 10 --wide-conv --csv generalization_random_goals_sep10_wideconv_10seed.csv
+
+generalization-sep-sweep: $(TARGET)
+	./$(TARGET) --generalization --episodes 5000 --seeds 10 --seed 1 --random-goals \
+		--min-separation 12 --csv generalization_random_goals_sep12_10seed.csv
+	./$(TARGET) --generalization --episodes 5000 --seeds 10 --seed 1 --random-goals \
+		--min-separation 14 --csv generalization_random_goals_sep14_10seed.csv
 
 video: $(TARGET)
 	./scripts/render_generalization_video.sh assets/conv_learning.mp4

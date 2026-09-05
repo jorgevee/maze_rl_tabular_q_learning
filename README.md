@@ -192,9 +192,42 @@ At the *same* 5,000-episode budget as the original negative result (a quarter of
 
 At 10 seeds, the two architectures start **identical** on the unbiased baseline (3.9% each) — the earlier 3-seed run's "layout already ahead of conv" reading doesn't hold up. The separation fix still helps both, but unevenly: the MLP's held-out score roughly doubles from a real signal spread across most seeds (successes in 8 of 10 seeds, not one outlier), while the convolutional model's improvement is smaller and closer to the edge of what 10 seeds can distinguish from noise. The originally reported 13.0% for the MLP was inflated by a single seed and should be read as 10.0%.
 
-The training-fit numbers are the more interesting thread: the MLP fits its own training distribution roughly 2x better than the convolutional model in *both* conditions (17.5% vs 7.5% unbiased; 51.3% vs 25.6% biased), not just the biased one. That consistency across two different training distributions points at something structural rather than a fluke of one run: the convolutional model compresses its two 13x13 input planes down to a 5x5x8 feature map (via a stride-2 second layer) before the goal-displacement values are mixed in, while the MLP's single dense layer combines every raw input pixel with the displacement values directly and without that spatial bottleneck. That compression was a good trade when the task had one shared, easy-to-represent start-to-goal direction (weight sharing paid for itself at the 22.2% original baseline with 38% fewer parameters). It looks like a worse trade once the task requires distinguishing many different goal directions and distances per maze — exactly the regime `--random-goals` puts both models in. This is a plausible mechanism, not a proven one; no ablation (e.g. a wider convolutional stack, or a parameter-matched MLP) has isolated capacity from inductive bias as the actual cause yet.
+The training-fit numbers are the more interesting thread: the MLP fits its own training distribution roughly 2x better than the convolutional model in *both* conditions (17.5% vs 7.5% unbiased; 51.3% vs 25.6% biased), not just the biased one. That consistency across two different training distributions points at something structural rather than a fluke of one run.
+
+### Isolating capacity from inductive bias: `--wide-conv`
+
+The gap above has two competing explanations: the convolutional model's spatial weight-sharing might be a genuinely worse fit for a task that needs many different goal directions, or it might simply have 38% fewer parameters (13,624 vs the MLP's 22,084) and less raw capacity. Those need different fixes, so `--wide-conv` adds a parameter-matched control: identical architecture (same kernel, stride, conv1 width, dense width), but a wider second convolutional layer (13 filters instead of 8) bringing total parameters to 21,809 — matched to the MLP's 22,084 within 1.2%, and still slightly fewer.
+
+```powershell
+.\maze_rl.exe --generalization --episodes 5000 --seeds 10 --seed 1 --random-goals --min-separation 10 --wide-conv --csv generalization_random_goals_sep10_wideconv_10seed.csv
+```
+
+| Metric | narrow conv (13,624p) | wide conv (21,809p) | layout MLP (22,084p) |
+| --- | ---: | ---: | ---: |
+| train-fit | 25.6% | 45.0% | 51.3% |
+| pool-fit | 27.1% | 41.9% | 43.4% |
+| held-out (all-unseen) | 5.0% | 5.6% | 10.0% |
+
+This cleanly separates two things that looked entangled before. **Capacity explains the train-fit and pool-fit gap almost entirely** — matching parameter count closed most of the distance to the MLP on both metrics (45.0% vs 51.3%; 41.9% vs 43.4%), with nothing else about the architecture changed. **Capacity does not explain the held-out gap** — the wide conv's held-out score (5.6%) is statistically indistinguishable from the narrow conv's (5.0%, per-seed spread checked: 0,2,1,1,0,2,0,0,4,0 — not one outlier), and both remain at roughly half the MLP's 10.0%.
+
+So: giving the convolutional model enough capacity to fit its own training distribution nearly as well as the MLP does *not* give it the MLP's transfer advantage. Whatever is actually driving the held-out gap survives a capacity fix, which points back toward something about the architecture's design (the spatial compression before goal-direction information is mixed in) rather than simple undercapacity — though this isn't fully proven either; a wider net still than 21,809 params, or more training specifically for the wide-conv variant, hasn't been tried, so a residual capacity effect on the held-out number specifically can't be ruled out yet.
 
 See `EXPERIMENTS.md` and `lessons_learned.md` for the full breakdown and the reasoning behind it.
+
+### Sweeping `--min-separation` toward the maximum
+
+`--min-separation 10` only tested one point between the unbiased baseline (0) and the training mazes' own corner-to-corner distance (14). Sweeping 12 and 14 (10 seeds each, standard architectures) shows the relationship is **not monotonic**:
+
+| `--min-separation` | conv unseen | layout unseen | conv train-fit | layout train-fit |
+| --- | ---: | ---: | ---: | ---: |
+| 0 | 3.9% | 3.9% | 7.5% | 17.5% |
+| 10 | 5.0% | 10.0% | 25.6% | 51.3% |
+| 12 | 2.2% | 7.8% | 41.9% | 66.9% |
+| 14 | 12.8% | 11.7% | 95.6% | 100% |
+
+Both architectures dip at 12 before recovering at 14 (per-seed spread checked for both — not an outlier). There's a clean geometric reason for the jump at 14: on this maze's 8x8 interior (coordinates 1-8), the maximum possible Manhattan distance between two cells is exactly 14, achieved by only **2 distinct cell pairs** (the two diagonals) — verified directly, not estimated. `--min-separation 14` therefore doesn't sample "very long routes" so much as collapse training down to (at most) two near-fixed start/goal pairs per maze, which is why train-fit jumps to 95.6-100%: it's a small, highly repeatable set of tasks, similar in spirit to the original fixed-corner baseline. `--min-separation 12`, by contrast, still permits many distinct cell pairs (long but not fully extreme), so it gets the *difficulty* of a demanding distribution without the *repeatability* that either a shorter separation (10) or the fully-collapsed extreme (14) provides — plausibly why it's the worst point of the four.
+
+One thing this rules out: `--min-separation 14` is not simply "put back what we removed." Randomizing which of the two diagonal cells is the start versus the goal means roughly half of training now runs in the *reverse* direction from the held-out suite's canonical `(1,1)` to `(8,8)` — so even at the geometric extreme, conv's held-out score (12.8%) stays well below its original confounded baseline (22.2%). The direction-reversal side effect of `--random-goals`'s symmetric sampling, not just the separation distance, is part of what's keeping these numbers below the original number.
 
 ### Render the convolutional learning video
 
