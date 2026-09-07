@@ -2,6 +2,7 @@
 #include "dqn.h"
 #include "environment.h"
 #include "generalization.h"
+#include "ppo.h"
 #include "tabular.h"
 #include "trainer.h"
 #include <math.h>
@@ -85,6 +86,7 @@ int main(void)
     if (!TestEnvironment()) return EXIT_FAILURE;
     if (!DqnRunSelfTests()) { fprintf(stderr, "FAIL: DQN internal self-tests\n"); return EXIT_FAILURE; }
     if (!GeneralizationRunSelfTests()) { fprintf(stderr, "FAIL: generalization experiment self-tests\n"); return EXIT_FAILURE; }
+    if (!PpoRunSelfTests()) { fprintf(stderr, "FAIL: PPO internal self-tests\n"); return EXIT_FAILURE; }
     if (!TestTabularDeterminism()) return EXIT_FAILURE;
     if (!TrainToOptimal(AGENT_TABULAR, 7)) return EXIT_FAILURE;
     if (!TrainToOptimal(AGENT_DQN, 7)) return EXIT_FAILURE;

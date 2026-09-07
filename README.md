@@ -233,6 +233,33 @@ One thing this rules out: `--min-separation 14` is not simply "put back what we 
 
 https://github.com/user-attachments/assets/d2289297-ace0-47bc-bece-839ec993c1c7
 
+## PPO on the single maze
+
+A third learner, implemented from scratch in the same dependency-free style: Proximal Policy Optimization, an on-policy policy-gradient method rather than an off-policy value method. Where DQN learns `Q(s,a)` and acts greedily with an epsilon schedule bolted on for exploration, PPO learns a stochastic policy `pi(a|s)` directly (exploration comes from *sampling* that policy) plus a separate value function used only to compute advantages.
+
+It lives in `src/ppo.c` with its own networks, rollout buffer and training loop, rather than implementing `learner.h` — that interface is built around `selectAction(state, epsilon, rng)` and `getQValues`, which don't describe an on-policy stochastic method. This follows the same precedent as `generalization.c`, which is also self-contained.
+
+```powershell
+.\maze_rl.exe --ppo --steps 60000 --seeds 5 --seed 1 --compare-dqn --csv ppo.csv
+```
+
+or with GNU Make: `make ppo`. `--compare-dqn` additionally trains a DQN baseline on the same maze with the same environment-step budget and evaluation cadence, writing both to one CSV.
+
+The actor is deliberately the same shape as the single-maze DQN (one-hot state, one 64-unit hidden layer, 6,724 parameters) so this isn't secretly a network-size comparison; the critic is the same trunk with a single scalar output (6,529 parameters). Kept as two separate networks rather than a shared trunk with two heads, because two independent backward passes are each verifiable by finite differences.
+
+### Result: both solve it, with opposite strengths
+
+| Algorithm | Optimal route | First greedy solve (env steps) | Wall clock / 60k steps |
+| --- | --- | ---: | ---: |
+| PPO | 5/5 seeds, 14 steps | 13,107 mean (8.2k-18.4k) | ~120 ms |
+| DQN | 5/5 seeds, 14 steps | 4,555 mean (4.1k-6.2k) | ~990 ms |
+
+Both find the same optimal 14-step route on every seed. **DQN is ~2.9x more sample-efficient** (fewer environment steps to first solve, on 5 of 5 seeds) — the expected direction, since replay lets it reuse each transition many times while PPO discards each batch after 4 epochs. **PPO is ~8x faster in wall clock** over the same budget, because DQN runs a 32-sample update every 4 environment steps (15,000 updates) while PPO runs 3,840 larger updates.
+
+Comparison is on **environment steps, not episodes** — an episode means different amounts of experience to each algorithm, and one PPO update (a whole rollout, reused over 4 epochs) isn't comparable to one DQN update (a replay minibatch). "First greedy solve" is checkpointed every 2,048 steps for both, so it's a coarse measure; the ~3x gap far exceeds that granularity and holds on every seed, but the exact multiplier shouldn't be read too precisely.
+
+Applying PPO to the held-out generalization suite (rather than this single maze) is designed but not yet built — see `ppo_design.md` for the staging and the open questions.
+
 ## Algorithms
 
 The complete training flow is available as a Graphviz diagram in [`assets/dqn_algorithm.dot`](assets/dqn_algorithm.dot). Render it after installing Graphviz with:
