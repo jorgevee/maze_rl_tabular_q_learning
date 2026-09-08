@@ -2,6 +2,7 @@
 #include "agent.h"
 #include "dqn.h"
 #include "environment.h"
+#include "generalization.h"
 #include "learner.h"
 #include "maze.h"
 #include "rl.h"
@@ -586,6 +587,453 @@ static void InitializeAgentNetworks(PpoAgent *agent, PpoConfig config, Rng *rng)
     ResetRolloutPosition(agent);
 }
 
+/* ---------- stage 2: the held-out generalization suite ----------
+
+   Same PPO algorithm as above, but over the multi-maze suite from
+   generalization.c instead of the single fixed maze, so it can be compared
+   against the DQN generalization results. Uses that file's maze suite,
+   layout-aware encoding and step function through the shared API in
+   generalization.h -- not a local copy -- so both algorithms provably see
+   the same environment.
+
+   The observation is the dense 340-value agent-centered crop rather than a
+   one-hot state, so these networks do a full matrix multiply on the first
+   layer instead of the column lookup the single-maze versions use. The
+   actor's 22,084 parameters match the layout-aware DQN model exactly. */
+
+typedef struct {
+    float w1[PPO_HIDDEN][GEN_LAYOUT_INPUT];
+    float b1[PPO_HIDDEN];
+    float w2[ACTION_COUNT][PPO_HIDDEN];
+    float b2[ACTION_COUNT];
+} GenActorNetwork;
+
+typedef struct {
+    float w1[PPO_HIDDEN][GEN_LAYOUT_INPUT];
+    float b1[PPO_HIDDEN];
+    float w2[PPO_HIDDEN];
+    float b2;
+} GenCriticNetwork;
+
+typedef struct {
+    float observation[GEN_LAYOUT_INPUT];
+    Action action;
+    float logProbOld;
+    float reward;
+    float value;
+    float nextValue;
+    bool episodeEnd;
+    float advantage;
+    float target;
+} GenPpoStep;
+
+typedef struct {
+    GenActorNetwork actor;
+    GenActorNetwork actorFirstMoment;
+    GenActorNetwork actorSecondMoment;
+    GenCriticNetwork critic;
+    GenCriticNetwork criticFirstMoment;
+    GenCriticNetwork criticSecondMoment;
+    int actorUpdates;
+    int criticUpdates;
+    PpoConfig config;
+    GenPpoStep steps[PPO_ROLLOUT_CAPACITY];
+    int stepCount;
+    int environmentSteps;
+    /* Current episode state: which training maze, where in it. */
+    GenMazeView currentMaze;
+    int currentState;
+    int currentEpisodeSteps;
+    float currentEpisodeReturn;
+    float completedReturnSum;
+    int completedEpisodes;
+    int completedGoals;
+} GenPpoAgent;
+
+static void InitializeGenActor(GenActorNetwork *actor, Rng *rng)
+{
+    memset(actor, 0, sizeof(*actor));
+    const float firstScale = sqrtf(2.0f / GEN_LAYOUT_INPUT);
+    const float secondScale = sqrtf(2.0f / PPO_HIDDEN);
+    for (int hidden = 0; hidden < PPO_HIDDEN; hidden++) {
+        for (int input = 0; input < GEN_LAYOUT_INPUT; input++)
+            actor->w1[hidden][input] = RngNormal(rng) * firstScale;
+    }
+    for (int action = 0; action < ACTION_COUNT; action++) {
+        for (int hidden = 0; hidden < PPO_HIDDEN; hidden++)
+            actor->w2[action][hidden] = RngNormal(rng) * secondScale;
+    }
+}
+
+static void InitializeGenCritic(GenCriticNetwork *critic, Rng *rng)
+{
+    memset(critic, 0, sizeof(*critic));
+    const float firstScale = sqrtf(2.0f / GEN_LAYOUT_INPUT);
+    const float secondScale = sqrtf(2.0f / PPO_HIDDEN);
+    for (int hidden = 0; hidden < PPO_HIDDEN; hidden++) {
+        for (int input = 0; input < GEN_LAYOUT_INPUT; input++)
+            critic->w1[hidden][input] = RngNormal(rng) * firstScale;
+        critic->w2[hidden] = RngNormal(rng) * secondScale;
+    }
+}
+
+static void GenActorForward(
+    const GenActorNetwork *actor,
+    const float *observation,
+    float hiddenValues[PPO_HIDDEN],
+    float logits[ACTION_COUNT])
+{
+    for (int hidden = 0; hidden < PPO_HIDDEN; hidden++) {
+        float value = actor->b1[hidden];
+        const float *row = actor->w1[hidden];
+        for (int input = 0; input < GEN_LAYOUT_INPUT; input++)
+            value += row[input] * observation[input];
+        hiddenValues[hidden] = value > 0.0f ? value : 0.0f;
+    }
+    for (int action = 0; action < ACTION_COUNT; action++) {
+        float value = actor->b2[action];
+        for (int hidden = 0; hidden < PPO_HIDDEN; hidden++)
+            value += actor->w2[action][hidden] * hiddenValues[hidden];
+        logits[action] = value;
+    }
+}
+
+static float GenCriticForward(
+    const GenCriticNetwork *critic,
+    const float *observation,
+    float hiddenValues[PPO_HIDDEN])
+{
+    float value = critic->b2;
+    for (int hidden = 0; hidden < PPO_HIDDEN; hidden++) {
+        float activation = critic->b1[hidden];
+        const float *row = critic->w1[hidden];
+        for (int input = 0; input < GEN_LAYOUT_INPUT; input++)
+            activation += row[input] * observation[input];
+        hiddenValues[hidden] = activation > 0.0f ? activation : 0.0f;
+        value += critic->w2[hidden] * hiddenValues[hidden];
+    }
+    return value;
+}
+
+static float GenActorLossFor(
+    const GenActorNetwork *actor,
+    const GenPpoStep *step,
+    float advantage,
+    const PpoConfig *config)
+{
+    float hidden[PPO_HIDDEN];
+    float logits[ACTION_COUNT];
+    GenActorForward(actor, step->observation, hidden, logits);
+    float probabilities[ACTION_COUNT];
+    float logProbabilities[ACTION_COUNT];
+    PolicyDistribution(logits, probabilities, logProbabilities);
+    float ratio = expf(logProbabilities[step->action] - step->logProbOld);
+    float clipped = ClipRatio(ratio, config->clipEpsilon);
+    float surrogate1 = ratio * advantage;
+    float surrogate2 = clipped * advantage;
+    float objective = surrogate1 <= surrogate2 ? surrogate1 : surrogate2;
+    float entropy = PolicyEntropy(probabilities, logProbabilities);
+    return -(objective + config->entropyCoefficient * entropy);
+}
+
+static void AccumulateGenActorGradient(
+    const GenActorNetwork *actor,
+    const GenPpoStep *step,
+    float advantage,
+    const PpoConfig *config,
+    float scale,
+    GenActorNetwork *gradient,
+    float *entropyOut)
+{
+    float hidden[PPO_HIDDEN];
+    float logits[ACTION_COUNT];
+    GenActorForward(actor, step->observation, hidden, logits);
+    float probabilities[ACTION_COUNT];
+    float logProbabilities[ACTION_COUNT];
+    PolicyDistribution(logits, probabilities, logProbabilities);
+
+    float ratio = expf(logProbabilities[step->action] - step->logProbOld);
+    float clipped = ClipRatio(ratio, config->clipEpsilon);
+    float surrogate1 = ratio * advantage;
+    float surrogate2 = clipped * advantage;
+    float objectiveGradient = surrogate1 <= surrogate2 ? ratio * advantage : 0.0f;
+    float entropy = PolicyEntropy(probabilities, logProbabilities);
+
+    float logitGradient[ACTION_COUNT];
+    for (int action = 0; action < ACTION_COUNT; action++) {
+        float logProbGradient = (action == (int)step->action ? 1.0f : 0.0f) -
+            probabilities[action];
+        float entropyGradient = -probabilities[action] *
+            (logProbabilities[action] + entropy);
+        logitGradient[action] = -(objectiveGradient * logProbGradient +
+            config->entropyCoefficient * entropyGradient) * scale;
+    }
+
+    for (int action = 0; action < ACTION_COUNT; action++) {
+        gradient->b2[action] += logitGradient[action];
+        for (int hiddenIndex = 0; hiddenIndex < PPO_HIDDEN; hiddenIndex++)
+            gradient->w2[action][hiddenIndex] += logitGradient[action] * hidden[hiddenIndex];
+    }
+    for (int hiddenIndex = 0; hiddenIndex < PPO_HIDDEN; hiddenIndex++) {
+        if (hidden[hiddenIndex] <= 0.0f) continue;
+        float hiddenGradient = 0.0f;
+        for (int action = 0; action < ACTION_COUNT; action++)
+            hiddenGradient += logitGradient[action] * actor->w2[action][hiddenIndex];
+        gradient->b1[hiddenIndex] += hiddenGradient;
+        float *row = gradient->w1[hiddenIndex];
+        for (int input = 0; input < GEN_LAYOUT_INPUT; input++)
+            row[input] += hiddenGradient * step->observation[input];
+    }
+
+    if (entropyOut) *entropyOut = entropy;
+}
+
+static float GenCriticLossFor(
+    const GenCriticNetwork *critic,
+    const float *observation,
+    float target)
+{
+    float hidden[PPO_HIDDEN];
+    float value = GenCriticForward(critic, observation, hidden);
+    return HuberLoss(value - target);
+}
+
+static void AccumulateGenCriticGradient(
+    const GenCriticNetwork *critic,
+    const float *observation,
+    float target,
+    float scale,
+    GenCriticNetwork *gradient,
+    float *lossOut)
+{
+    float hidden[PPO_HIDDEN];
+    float value = GenCriticForward(critic, observation, hidden);
+    float error = value - target;
+    float outputGradient = HuberDerivative(error) * scale;
+
+    gradient->b2 += outputGradient;
+    for (int hiddenIndex = 0; hiddenIndex < PPO_HIDDEN; hiddenIndex++) {
+        gradient->w2[hiddenIndex] += outputGradient * hidden[hiddenIndex];
+        if (hidden[hiddenIndex] > 0.0f) {
+            float hiddenGradient = outputGradient * critic->w2[hiddenIndex];
+            gradient->b1[hiddenIndex] += hiddenGradient;
+            float *row = gradient->w1[hiddenIndex];
+            for (int input = 0; input < GEN_LAYOUT_INPUT; input++)
+                row[input] += hiddenGradient * observation[input];
+        }
+    }
+    if (lossOut) *lossOut = HuberLoss(error);
+}
+
+static void ComputeGenAdvantages(GenPpoStep *steps, int count, const PpoConfig *config)
+{
+    float nextAdvantage = 0.0f;
+    for (int index = count - 1; index >= 0; index--) {
+        if (steps[index].episodeEnd) nextAdvantage = 0.0f;
+        float delta = steps[index].reward +
+            config->gamma * steps[index].nextValue - steps[index].value;
+        steps[index].advantage = delta + config->gamma * config->lambda * nextAdvantage;
+        nextAdvantage = steps[index].advantage;
+        steps[index].target = steps[index].advantage + steps[index].value;
+    }
+}
+
+static void NormalizeGenAdvantages(GenPpoStep *steps, int count)
+{
+    if (count < 2) return;
+    double sum = 0.0;
+    for (int index = 0; index < count; index++) sum += steps[index].advantage;
+    float mean = (float)(sum / count);
+    double varianceSum = 0.0;
+    for (int index = 0; index < count; index++) {
+        double difference = (double)steps[index].advantage - mean;
+        varianceSum += difference * difference;
+    }
+    float deviation = (float)sqrt(varianceSum / count);
+    for (int index = 0; index < count; index++)
+        steps[index].advantage = (steps[index].advantage - mean) / (deviation + 1.0e-8f);
+}
+
+/* Starts a fresh training episode on one of the 16 training mazes, honoring
+   the same start/goal randomization options the DQN experiments use. */
+static void StartGenEpisode(
+    GenPpoAgent *agent,
+    const ExperimentMaze mazes[GEN_MAZE_COUNT],
+    bool randomGoals,
+    int minSeparation,
+    Rng *rng)
+{
+    int mazeIndex = RngRange(rng, GEN_TRAIN_MAZES);
+    agent->currentMaze = GenViewOfMaze(&mazes[mazeIndex]);
+    if (randomGoals) {
+        int randomStart;
+        int randomGoal;
+        GenRandomizeStartGoal(&mazes[mazeIndex], &randomStart, &randomGoal,
+            minSeparation, rng);
+        agent->currentMaze.goalState = randomGoal;
+        agent->currentState = randomStart;
+    } else {
+        agent->currentState = mazes[mazeIndex].startState;
+    }
+    agent->currentEpisodeSteps = 0;
+    agent->currentEpisodeReturn = 0.0f;
+}
+
+static void CollectGenRollout(
+    GenPpoAgent *agent,
+    const ExperimentMaze mazes[GEN_MAZE_COUNT],
+    bool randomGoals,
+    int minSeparation,
+    Rng *rng)
+{
+    agent->stepCount = 0;
+    agent->completedReturnSum = 0.0f;
+    agent->completedEpisodes = 0;
+    agent->completedGoals = 0;
+
+    for (int index = 0; index < agent->config.rolloutSteps; index++) {
+        GenPpoStep *step = &agent->steps[agent->stepCount++];
+        GenEncodeLayout(&agent->currentMaze, agent->currentState, step->observation);
+
+        float actorHidden[PPO_HIDDEN];
+        float logits[ACTION_COUNT];
+        GenActorForward(&agent->actor, step->observation, actorHidden, logits);
+        float probabilities[ACTION_COUNT];
+        float logProbabilities[ACTION_COUNT];
+        PolicyDistribution(logits, probabilities, logProbabilities);
+        Action action = SampleAction(probabilities, rng);
+
+        float criticHidden[PPO_HIDDEN];
+        float value = GenCriticForward(&agent->critic, step->observation, criticHidden);
+
+        GenStepOutcome outcome = GenStep(&agent->currentMaze, agent->currentState, action);
+        agent->environmentSteps++;
+        agent->currentEpisodeSteps++;
+        agent->currentEpisodeReturn += outcome.reward;
+        bool truncated = !outcome.done && agent->currentEpisodeSteps >= GEN_MAX_STEPS;
+
+        step->action = action;
+        step->logProbOld = logProbabilities[action];
+        step->reward = outcome.reward;
+        step->value = value;
+        step->episodeEnd = outcome.done || truncated;
+        if (outcome.done) {
+            step->nextValue = 0.0f;
+        } else {
+            float nextObservation[GEN_LAYOUT_INPUT];
+            float nextHidden[PPO_HIDDEN];
+            GenEncodeLayout(&agent->currentMaze, outcome.nextState, nextObservation);
+            step->nextValue = GenCriticForward(&agent->critic, nextObservation, nextHidden);
+        }
+
+        if (step->episodeEnd) {
+            agent->completedReturnSum += agent->currentEpisodeReturn;
+            agent->completedEpisodes++;
+            if (outcome.done) agent->completedGoals++;
+            StartGenEpisode(agent, mazes, randomGoals, minSeparation, rng);
+        } else {
+            agent->currentState = outcome.nextState;
+        }
+    }
+}
+
+static void TrainOnGenRollout(GenPpoAgent *agent, Rng *rng, PpoBatchStats *stats)
+{
+    static int order[PPO_ROLLOUT_CAPACITY];
+    for (int index = 0; index < agent->stepCount; index++) order[index] = index;
+
+    double entropySum = 0.0;
+    double valueLossSum = 0.0;
+    long sampleCount = 0;
+
+    GenActorNetwork *actorGradient = malloc(sizeof(GenActorNetwork));
+    GenCriticNetwork *criticGradient = malloc(sizeof(GenCriticNetwork));
+    if (!actorGradient || !criticGradient) {
+        free(actorGradient);
+        free(criticGradient);
+        return;
+    }
+
+    for (int epoch = 0; epoch < agent->config.epochs; epoch++) {
+        for (int index = agent->stepCount - 1; index > 0; index--) {
+            int other = RngRange(rng, index + 1);
+            int swap = order[index];
+            order[index] = order[other];
+            order[other] = swap;
+        }
+
+        for (int start = 0; start < agent->stepCount; start += agent->config.minibatchSize) {
+            int end = start + agent->config.minibatchSize;
+            if (end > agent->stepCount) end = agent->stepCount;
+            int size = end - start;
+            if (size <= 0) continue;
+            float scale = 1.0f / (float)size;
+
+            memset(actorGradient, 0, sizeof(*actorGradient));
+            memset(criticGradient, 0, sizeof(*criticGradient));
+
+            for (int index = start; index < end; index++) {
+                GenPpoStep *step = &agent->steps[order[index]];
+                float entropy = 0.0f;
+                AccumulateGenActorGradient(&agent->actor, step, step->advantage,
+                    &agent->config, scale, actorGradient, &entropy);
+                float valueLoss = 0.0f;
+                AccumulateGenCriticGradient(&agent->critic, step->observation,
+                    step->target, scale, criticGradient, &valueLoss);
+                entropySum += entropy;
+                valueLossSum += valueLoss;
+                sampleCount++;
+            }
+
+            agent->actorUpdates++;
+            AdamStep((float *)&agent->actor, (float *)&agent->actorFirstMoment,
+                (float *)&agent->actorSecondMoment, (float *)actorGradient,
+                sizeof(GenActorNetwork) / sizeof(float), agent->actorUpdates,
+                agent->config.learningRate, agent->config.gradientClip);
+
+            agent->criticUpdates++;
+            AdamStep((float *)&agent->critic, (float *)&agent->criticFirstMoment,
+                (float *)&agent->criticSecondMoment, (float *)criticGradient,
+                sizeof(GenCriticNetwork) / sizeof(float), agent->criticUpdates,
+                agent->config.learningRate, agent->config.gradientClip);
+        }
+    }
+
+    free(actorGradient);
+    free(criticGradient);
+
+    if (stats && sampleCount > 0) {
+        stats->entropy = (float)(entropySum / (double)sampleCount);
+        stats->valueLoss = (float)(valueLossSum / (double)sampleCount);
+        stats->clipFraction = 0.0f;
+    }
+}
+
+/* Greedy (argmax) rollout on one suite maze at its canonical start/goal --
+   the identical evaluation protocol the DQN generalization runs use. */
+static EpisodeResult EvaluateGenGreedy(const GenPpoAgent *agent, const ExperimentMaze *maze)
+{
+    EpisodeResult result = {0};
+    GenMazeView view = GenViewOfMaze(maze);
+    int state = maze->startState;
+    for (int step = 0; step < GEN_MAX_STEPS; step++) {
+        float observation[GEN_LAYOUT_INPUT];
+        float hidden[PPO_HIDDEN];
+        float logits[ACTION_COUNT];
+        GenEncodeLayout(&view, state, observation);
+        GenActorForward(&agent->actor, observation, hidden, logits);
+        int best = 0;
+        for (int action = 1; action < ACTION_COUNT; action++)
+            if (logits[action] > logits[best]) best = action;
+        GenStepOutcome outcome = GenStep(&view, state, (Action)best);
+        result.totalReward += outcome.reward;
+        result.steps = step + 1;
+        state = outcome.nextState;
+        if (outcome.done) { result.reachedGoal = true; break; }
+    }
+    return result;
+}
+
 /* ---------- experiment driver ---------- */
 
 typedef struct {
@@ -594,11 +1042,14 @@ typedef struct {
     uint64_t firstSeed;
     const char *csvPath;
     bool compareDqn;
+    bool generalize;
+    bool randomGoals;
+    int minSeparation;
 } PpoOptions;
 
 static PpoOptions DefaultPpoOptions(void)
 {
-    return (PpoOptions){200000, 5, 1, "ppo.csv", false};
+    return (PpoOptions){200000, 5, 1, "ppo.csv", false, false, false, 0};
 }
 
 static bool ParsePpoPositive(const char *text, int *value)
@@ -626,8 +1077,24 @@ static bool ParsePpoOptions(int argc, char **argv, PpoOptions *options)
             options->csvPath = argv[++index];
         } else if (strcmp(argv[index], "--compare-dqn") == 0) {
             options->compareDqn = true;
+        } else if (strcmp(argv[index], "--generalize") == 0) {
+            options->generalize = true;
+        } else if (strcmp(argv[index], "--random-goals") == 0) {
+            options->randomGoals = true;
+        } else if (strcmp(argv[index], "--min-separation") == 0 && index + 1 < argc) {
+            char *end = NULL;
+            long parsed = strtol(argv[++index], &end, 10);
+            if (end == argv[index] || *end != '\0' || parsed < 0 || parsed > 1000)
+                return false;
+            options->minSeparation = (int)parsed;
         } else return false;
     }
+    /* The start/goal options only mean anything on the multi-maze suite, and
+       min-separation only means anything when goals are randomized. */
+    if ((options->randomGoals || options->minSeparation > 0) && !options->generalize)
+        return false;
+    if (options->minSeparation > 0 && !options->randomGoals) return false;
+    if (options->compareDqn && options->generalize) return false;
     return true;
 }
 
@@ -763,14 +1230,118 @@ static int RunDqnBaselineSeed(FILE *csv, const PpoOptions *options, uint64_t see
     return 0;
 }
 
+/* Stage 2 driver: train PPO on the 16 training mazes, evaluate greedily on
+   the whole 34-maze suite at canonical start/goal, exactly as the DQN
+   generalization runs do. */
+static int RunGenPpoSeed(
+    FILE *csv,
+    const PpoOptions *options,
+    const ExperimentMaze mazes[GEN_MAZE_COUNT],
+    uint64_t seed)
+{
+    Rng rng;
+    RngSeed(&rng, seed ^ UINT64_C(0x5050474e));
+    GenPpoAgent *agent = malloc(sizeof(GenPpoAgent));
+    if (!agent) return 1;
+    memset(agent, 0, sizeof(*agent));
+    agent->config = DefaultPpoConfig();
+    InitializeGenActor(&agent->actor, &rng);
+    InitializeGenCritic(&agent->critic, &rng);
+    StartGenEpisode(agent, mazes, options->randomGoals, options->minSeparation, &rng);
+
+    char trainMode[32];
+    if (options->randomGoals && options->minSeparation > 0) {
+        snprintf(trainMode, sizeof(trainMode), "fixed_%d_random_goals_sep%d",
+            GEN_TRAIN_MAZES, options->minSeparation);
+    } else if (options->randomGoals) {
+        snprintf(trainMode, sizeof(trainMode), "fixed_%d_random_goals", GEN_TRAIN_MAZES);
+    } else {
+        snprintf(trainMode, sizeof(trainMode), "fixed_%d", GEN_TRAIN_MAZES);
+    }
+
+    clock_t start = clock();
+    while (agent->environmentSteps < options->totalSteps) {
+        CollectGenRollout(agent, mazes, options->randomGoals, options->minSeparation, &rng);
+        ComputeGenAdvantages(agent->steps, agent->stepCount, &agent->config);
+        NormalizeGenAdvantages(agent->steps, agent->stepCount);
+        TrainOnGenRollout(agent, &rng, NULL);
+    }
+    double elapsed = 1000.0 * (double)(clock() - start) / CLOCKS_PER_SEC;
+
+    int groupSuccess[4] = {0};
+    int groupTotal[4] = {0};
+    for (int mazeIndex = 0; mazeIndex < GEN_MAZE_COUNT; mazeIndex++) {
+        EpisodeResult evaluation = EvaluateGenGreedy(agent, &mazes[mazeIndex]);
+        const ExperimentMaze *maze = &mazes[mazeIndex];
+        int gap = evaluation.reachedGoal ? evaluation.steps - maze->optimalSteps : -1;
+        fprintf(csv, "%llu,ppo_layout,%s,%s,%s,%llu,%dx%d,%d,%d,%d,%d,%.1f,%.3f,%d\n",
+            (unsigned long long)seed,
+            trainMode,
+            maze->split,
+            maze->name,
+            (unsigned long long)maze->generationSeed,
+            maze->width,
+            maze->height,
+            maze->optimalSteps,
+            evaluation.reachedGoal ? 1 : 0,
+            evaluation.steps,
+            gap,
+            evaluation.totalReward,
+            elapsed,
+            (int)(sizeof(GenActorNetwork) / sizeof(float)));
+        int group = mazeIndex < GEN_TRAIN_MAZES ? 0 :
+            mazeIndex < GEN_TRAIN_MAZES + GEN_TEST_PER_GROUP ? 1 :
+            mazeIndex < GEN_TRAIN_MAZES + 2 * GEN_TEST_PER_GROUP ? 2 : 3;
+        groupTotal[group]++;
+        if (evaluation.reachedGoal) groupSuccess[group]++;
+    }
+
+    printf("seed=%llu algorithm=ppo_layout train_mode=%s steps=%d train=%d/%d same=%d/%d smaller=%d/%d larger=%d/%d time=%.0fms\n",
+        (unsigned long long)seed,
+        trainMode,
+        agent->environmentSteps,
+        groupSuccess[0], groupTotal[0], groupSuccess[1], groupTotal[1],
+        groupSuccess[2], groupTotal[2], groupSuccess[3], groupTotal[3], elapsed);
+    free(agent);
+    return 0;
+}
+
+static int RunGenPpoExperiment(const PpoOptions *options)
+{
+    ExperimentMaze *mazes = malloc(sizeof(ExperimentMaze) * GEN_MAZE_COUNT);
+    if (!mazes) return 1;
+    GenBuildMazeSuite(mazes, GEN_SUITE_SEED);
+
+    FILE *csv = fopen(options->csvPath, "w");
+    if (!csv) {
+        fprintf(stderr, "Could not open CSV output: %s\n", options->csvPath);
+        free(mazes);
+        return 1;
+    }
+    /* Same schema as the DQN generalization CSV, so both can be analyzed
+       with the same tooling. */
+    fprintf(csv, "seed,observation,train_mode,split,maze,maze_seed,size,optimal_steps,"
+        "success,steps,excess_steps,return,training_ms,parameters\n");
+    int status = 0;
+    for (int offset = 0; offset < options->seeds && status == 0; offset++) {
+        status = RunGenPpoSeed(csv, options, mazes, options->firstSeed + (uint64_t)offset);
+        fflush(csv);
+    }
+    fclose(csv);
+    free(mazes);
+    if (status == 0) printf("Wrote PPO generalization results to %s\n", options->csvPath);
+    return status;
+}
+
 int RunPpoExperiment(int argc, char **argv)
 {
     PpoOptions options;
     if (!ParsePpoOptions(argc, argv, &options)) {
         fprintf(stderr, "Usage: %s --ppo [--steps N] [--seeds N] [--seed N] [--csv FILE] "
-            "[--compare-dqn]\n", argv[0]);
+            "[--compare-dqn | --generalize [--random-goals [--min-separation N]]]\n", argv[0]);
         return 2;
     }
+    if (options.generalize) return RunGenPpoExperiment(&options);
     FILE *csv = fopen(options.csvPath, "w");
     if (!csv) {
         fprintf(stderr, "Could not open CSV output: %s\n", options.csvPath);
@@ -1021,8 +1592,111 @@ static bool DeterminismSelfTest(void)
     return equal;
 }
 
+/* The stage-2 networks take a dense 340-value observation instead of a
+   one-hot state, so their first-layer backprop is a different code path and
+   needs its own finite-difference check. */
+static bool GenGradientSelfTest(void)
+{
+    Rng rng;
+    RngSeed(&rng, UINT64_C(0xb7e15163));
+    ExperimentMaze *mazes = malloc(sizeof(ExperimentMaze) * GEN_MAZE_COUNT);
+    GenActorNetwork *actor = malloc(sizeof(GenActorNetwork));
+    GenActorNetwork *actorGradient = malloc(sizeof(GenActorNetwork));
+    GenCriticNetwork *critic = malloc(sizeof(GenCriticNetwork));
+    GenCriticNetwork *criticGradient = malloc(sizeof(GenCriticNetwork));
+    GenPpoStep *step = malloc(sizeof(GenPpoStep));
+    bool passed = false;
+
+    if (!mazes || !actor || !actorGradient || !critic || !criticGradient || !step)
+        goto cleanup;
+
+    GenBuildMazeSuite(mazes, GEN_SUITE_SEED);
+    InitializeGenActor(actor, &rng);
+    InitializeGenCritic(critic, &rng);
+
+    memset(step, 0, sizeof(*step));
+    GenMazeView view = GenViewOfMaze(&mazes[0]);
+    GenEncodeLayout(&view, mazes[0].startState, step->observation);
+    step->action = ACTION_RIGHT;
+
+    /* Start the ratio at exactly 1, inside the clip range, where the
+       objective is differentiable. */
+    float hidden[PPO_HIDDEN];
+    float logits[ACTION_COUNT];
+    GenActorForward(actor, step->observation, hidden, logits);
+    float probabilities[ACTION_COUNT];
+    float logProbabilities[ACTION_COUNT];
+    PolicyDistribution(logits, probabilities, logProbabilities);
+    step->logProbOld = logProbabilities[step->action];
+    const float advantage = 0.6f;
+    const float target = 0.3f;
+    const float epsilon = 1.0e-3f;
+    PpoConfig config = DefaultPpoConfig();
+
+    memset(actorGradient, 0, sizeof(*actorGradient));
+    AccumulateGenActorGradient(actor, step, advantage, &config, 1.0f, actorGradient, NULL);
+    /* Probe an input weight on a channel the observation actually activates,
+       plus an output weight, covering both backprop stages. */
+    int activeInput = -1;
+    for (int input = 0; input < GEN_LAYOUT_INPUT; input++) {
+        if (fabsf(step->observation[input]) > 0.5f) { activeInput = input; break; }
+    }
+    if (activeInput < 0) goto cleanup;
+
+    float *actorProbes[2] = {&actor->w2[ACTION_RIGHT][0], &actor->w1[0][activeInput]};
+    const float *actorAnalytic[2] = {
+        &actorGradient->w2[ACTION_RIGHT][0],
+        &actorGradient->w1[0][activeInput]
+    };
+    for (int probe = 0; probe < 2; probe++) {
+        float original = *actorProbes[probe];
+        *actorProbes[probe] = original + epsilon;
+        float plus = GenActorLossFor(actor, step, advantage, &config);
+        *actorProbes[probe] = original - epsilon;
+        float minus = GenActorLossFor(actor, step, advantage, &config);
+        *actorProbes[probe] = original;
+        float numerical = (plus - minus) / (2.0f * epsilon);
+        if (fabsf(numerical - *actorAnalytic[probe]) > 2.0e-3f) goto cleanup;
+    }
+
+    memset(criticGradient, 0, sizeof(*criticGradient));
+    AccumulateGenCriticGradient(critic, step->observation, target, 1.0f,
+        criticGradient, NULL);
+    float *criticProbes[2] = {&critic->w2[0], &critic->w1[0][activeInput]};
+    const float *criticAnalytic[2] = {
+        &criticGradient->w2[0],
+        &criticGradient->w1[0][activeInput]
+    };
+    for (int probe = 0; probe < 2; probe++) {
+        float original = *criticProbes[probe];
+        *criticProbes[probe] = original + epsilon;
+        float plus = GenCriticLossFor(critic, step->observation, target);
+        *criticProbes[probe] = original - epsilon;
+        float minus = GenCriticLossFor(critic, step->observation, target);
+        *criticProbes[probe] = original;
+        float numerical = (plus - minus) / (2.0f * epsilon);
+        if (fabsf(numerical - *criticAnalytic[probe]) > 2.0e-3f) goto cleanup;
+    }
+
+    passed = true;
+
+cleanup:
+    free(mazes);
+    free(actor);
+    free(actorGradient);
+    free(critic);
+    free(criticGradient);
+    free(step);
+    return passed;
+}
+
 bool PpoRunSelfTests(void)
 {
+    /* The stage-2 actor matches the layout-aware DQN's 22,084 parameters, as
+       the single-maze actor matches the single-maze DQN's 6,724. */
+    if (sizeof(GenActorNetwork) / sizeof(float) != 22084) return false;
+    if (sizeof(GenCriticNetwork) / sizeof(float) != 21889) return false;
+    if (!GenGradientSelfTest()) return false;
     /* Parameter counts: the actor deliberately matches the single-maze DQN
        (6,724) so the comparison is not also a network-size comparison. */
     if (sizeof(ActorNetwork) / sizeof(float) != 6724) return false;

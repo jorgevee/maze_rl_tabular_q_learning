@@ -54,6 +54,10 @@ generalization_random_goals_sep10_wideconv_10seed.csv
 generalization_random_goals_sep12_10seed.csv
 generalization_random_goals_sep14_10seed.csv
 ppo.csv
+ppo_generalization_fixed.csv
+ppo_generalization_sep10.csv
+ppo_generalization_sep10_s11.csv
+generalization_random_goals_sep10_s11.csv
 # CLion / JetBrains
 .idea/
 

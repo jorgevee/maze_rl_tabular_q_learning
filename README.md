@@ -1,13 +1,18 @@
-# Tabular Q-Learning vs DQN Maze
+# Maze RL: Tabular Q-Learning to DQN to PPO
 
-A native C and raylib teaching project that solves the same fixed 10 by 10 maze with two reinforcement-learning agents:
+A native C and raylib teaching project that walks the same maze problem up three rungs of reinforcement learning, each written from scratch with no machine-learning library:
 
-- tabular Q-learning with a 100 by 4 Q-table
-- a dependency-free Deep Q-Network (DQN) implemented from scratch in C
+| Learner | Family | What it learns | Key machinery |
+| --- | --- | --- | --- |
+| **Tabular Q-learning** | value-based | a 100 by 4 Q-table | one update rule |
+| **DQN** | value-based, off-policy | `Q(s,a)` via a network | replay buffer, target network |
+| **PPO** | policy-gradient, on-policy | `pi(a\|s)` directly | GAE, clipped surrogate objective |
 
 ![Trained Q-learning maze showing policy arrows and the Q-value heatmap](assets/mazesc1.png)
 
-The comparison is deliberately unfair to DQN in an instructive way. A Q-table is an excellent fit for this tiny, fully observable discrete environment. DQN can learn the same optimal policy, but needs a neural network, replay memory, minibatch optimization, and a target network to do it.
+Each rung answers something the previous one couldn't. The tabular-vs-DQN comparison is deliberately unfair to DQN in an instructive way: a Q-table is an excellent fit for this tiny, fully observable environment, so DQN reaches the same optimal policy at far greater cost and no benefit. The point of the neural network only becomes visible in the [held-out generalization experiment](#held-out-maze-generalization-experiment), where the agent must handle mazes it never trained on. PPO then changes the *algorithm* rather than the data or architecture — and, on that same suite, roughly doubles DQN's held-out success.
+
+**Current focus is PPO** — see [PPO essentials](#ppo-essentials) for the math, and [`ppo_design.md`](ppo_design.md) for the design and open questions.
 
 ## Build and run
 
@@ -23,9 +28,227 @@ The executable supports both the interactive raylib application and headless exp
 On the current Windows setup, where `gcc` is available but `make` is not on `PATH`, use:
 
 ```powershell
-gcc -std=c11 -O2 -Wall -Wextra -pedantic src\main.c src\maze.c src\agent.c src\environment.c src\rl.c src\rng.c src\learner.c src\tabular.c src\dqn.c src\trainer.c src\benchmark.c src\generalization.c -o maze_rl.exe -IC:\msys64\mingw64\include -LC:\msys64\mingw64\lib -lraylib -lopengl32 -lgdi32 -lwinmm -lm
+gcc -std=c11 -O2 -Wall -Wextra -pedantic src\main.c src\maze.c src\agent.c src\environment.c src\rl.c src\rng.c src\learner.c src\tabular.c src\dqn.c src\ppo.c src\trainer.c src\benchmark.c src\generalization.c -o maze_rl.exe -IC:\msys64\mingw64\include -LC:\msys64\mingw64\lib -lraylib -lopengl32 -lgdi32 -lwinmm -lm
 .\maze_rl.exe
 ```
+
+## The three algorithms at a glance
+
+All learners share the maze, the reward structure (`+100` goal, `-5` wall bump, `-1` step), the 200-step episode limit, and the discount factor `gamma = 0.95`.
+
+**Tabular Q-learning** — one update rule, 400 numbers, no network:
+
+```text
+Q(s,a) <- Q(s,a) + alpha * [r + gamma * max_a' Q(s',a') - Q(s,a)]
+```
+
+**DQN** — the same Bellman idea with a network standing in for the table, plus the two stabilizers that makes necessary:
+
+```text
+y_j = r_j                                       if terminal
+y_j = r_j + gamma * max_a' Q(s'_j, a'; theta^-) otherwise    <- frozen target network
+
+L(theta) = mean over minibatch of Huber_1( y_j - Q(s_j, a_j; theta) )
+```
+
+- 100-element one-hot state input, `100 -> 64 ReLU -> 4` (6,724 parameters), He initialization
+- 10,000-transition circular replay buffer, 500-transition warm-up, 32-transition minibatches
+- Adam at learning rate `0.001`, gradient-norm clipping at `10`
+- target network copied every 250 optimizer updates
+- epsilon-greedy exploration, `1.0` decaying to `0.05`
+
+One-hot input keeps the baseline honest: DQN gets the same state identity the Q-table uses, without pretending flattened state numbers have meaningful numeric distance.
+
+**PPO** — a different family entirely; the math is below.
+
+The DQN training flow is available as a Graphviz diagram in [`assets/dqn_algorithm.dot`](assets/dqn_algorithm.dot):
+
+```powershell
+dot -Tsvg assets/dqn_algorithm.dot -o assets/dqn_algorithm.svg
+```
+
+## PPO essentials
+
+Let `s_t` be the state at step `t`, `a_t` the action taken, `theta` the actor (policy) parameters, and `phi` the critic (value) parameters.
+
+### The core difference from DQN
+
+DQN learns `Q(s,a)` — a number per action — and *derives* behavior by taking the argmax, with an epsilon schedule bolted on from outside so it explores. PPO learns the behavior directly:
+
+```text
+DQN:  network -> Q(s,a) for each a       -> act = argmax  (+ epsilon noise)
+PPO:  network -> pi(a|s), a distribution -> act = sample from it
+```
+
+Exploration is therefore *intrinsic* to PPO. An uncertain policy spreads probability across several actions and naturally tries them; a confident one doesn't. There is no epsilon anywhere in the implementation.
+
+### Policy: softmax over action logits
+
+The actor emits one logit per action, and a softmax turns them into a distribution:
+
+```text
+z = Actor(s; theta)                     <- 4 logits
+pi(a|s)     = exp(z_a) / sum_b exp(z_b)
+log pi(a|s) = z_a - log sum_b exp(z_b)
+```
+
+Implemented with the standard max-subtraction trick so large logits cannot overflow `exp`:
+
+```text
+m = max_b z_b
+pi(a|s) = exp(z_a - m) / sum_b exp(z_b - m)
+```
+
+### Rollout collection
+
+PPO is *on-policy*: it must learn from data its current policy generated, so there is no replay buffer. It collects a fixed batch of `T` environment steps (spanning several episodes), recording per step:
+
+```text
+a_t        ~ pi(.|s_t)              <- sampled, not argmax
+logp_old_t = log pi(a_t|s_t)        <- frozen here; the "old policy" for the ratio below
+v_t        = Critic(s_t; phi)
+r_t, done_t                          <- from the environment
+```
+
+After a few epochs of updates the batch is **discarded**. That is PPO's fundamental sample-efficiency cost relative to DQN's replay, and it shows up directly in the single-maze result below (~2.9x more environment steps to first solve).
+
+### Generalized Advantage Estimation (GAE)
+
+The advantage answers "was this action better than what the critic expected from this state?" The cheapest estimate is the one-step TD residual:
+
+```text
+delta_t = r_t + gamma * v_{t+1} * (1 - done_t) - v_t
+```
+
+Using only `delta_t` is low-variance but biased — it trusts the critic completely. Summing all actual future rewards instead is unbiased but high-variance. GAE interpolates between those with `lambda`, as a backward recursion over the batch:
+
+```text
+A_t = delta_t + gamma * lambda * (1 - done_t) * A_{t+1}
+  A_T = 0     (nothing was collected beyond the last step)
+
+lambda = 0  ->  A_t = delta_t                     (one-step TD: biased, low variance)
+lambda = 1  ->  A_t = discounted return - v_t     (Monte Carlo: unbiased, high variance)
+```
+
+The critic's regression target falls out of the same quantity:
+
+```text
+target_t = A_t + v_t
+```
+
+Advantages are then normalized across the batch — standard and load-bearing, not cosmetic:
+
+```text
+A <- (A - mean(A)) / (std(A) + 1e-8)
+```
+
+### The clipped surrogate objective
+
+This is the part PPO is named for. Because one batch is reused for several epochs, the policy drifts away from the one that collected the data. The importance ratio measures that drift:
+
+```text
+ratio_t = pi_new(a_t|s_t) / pi_old(a_t|s_t)
+        = exp( log pi_new(a_t|s_t) - logp_old_t )
+```
+
+A plain policy-gradient objective `ratio_t * A_t` would happily push that ratio arbitrarily far within a single batch, which destabilizes training. PPO instead takes the *pessimistic* of the raw and clipped versions:
+
+```text
+L_clip_t = min( ratio_t * A_t,
+                clip(ratio_t, 1 - eps, 1 + eps) * A_t )
+  eps = 0.2
+```
+
+What that `min` actually does, case by case:
+
+```text
+A_t > 0 (good action), ratio > 1+eps  ->  clipped branch wins, gradient = 0
+                                          (already made it likelier; stop)
+A_t > 0,               ratio < 1-eps  ->  raw branch wins, gradient flows
+                                          (drifted the wrong way; recover)
+A_t < 0 (bad action),  ratio < 1-eps  ->  clipped branch wins, gradient = 0
+                                          (already made it rarer; stop)
+A_t < 0,               ratio > 1+eps  ->  raw branch wins, gradient flows
+                                          (drifted the wrong way; push down)
+```
+
+So the clip only ever removes the incentive to keep moving in a direction already moved too far — it never blocks a correction back toward the old policy. In the implementation this is literally "if the clipped branch is selected, contribute no policy gradient," which a self-test verifies directly.
+
+### Entropy bonus
+
+Sampling alone doesn't guarantee continued exploration: a policy can collapse to near-deterministic early and stop discovering anything. An entropy term pushes back on that.
+
+```text
+H(s) = -sum_a pi(a|s) * log pi(a|s)
+
+  H = log(4) ~ 1.386   uniform over 4 actions (maximum)
+  H -> 0               deterministic
+```
+
+### The full objective
+
+```text
+policy_loss = -( mean_t[ L_clip_t ] + c_ent * mean_t[ H(s_t) ] )
+value_loss  =    mean_t[ Huber_1( target_t - Critic(s_t; phi) ) ]
+
+  c_ent = 0.01
+```
+
+Actor and critic are separate networks with separate Adam optimizers, so the two losses never mix gradients. A shared trunk is more common in production PPO; separate networks were chosen here so each backward pass is independently verifiable by finite differences.
+
+### The update loop
+
+```text
+repeat:
+  collect T = 2048 environment steps with the current policy
+  compute GAE advantages and targets, then normalize the advantages
+  for epoch in 1..K:                       K = 4
+    shuffle the batch
+    for each minibatch of 64:
+      Adam step on the actor  using policy_loss
+      Adam step on the critic using value_loss
+  discard the batch
+```
+
+### Hyperparameters and network shapes
+
+| Symbol | Meaning | Value |
+| --- | --- | ---: |
+| `gamma` | discount | 0.95 |
+| `lambda` | GAE smoothing | 0.95 |
+| `eps` | clip range | 0.2 |
+| `c_ent` | entropy coefficient | 0.01 |
+| `T` | rollout length (steps per batch) | 2,048 |
+| `K` | epochs per batch | 4 |
+| | minibatch size | 64 |
+| `alpha` | Adam learning rate | 3e-4 |
+| | gradient-norm clip | 0.5 |
+
+Network shapes are chosen to match their DQN counterparts exactly, so no comparison is secretly about network size:
+
+```text
+single maze       actor:  one-hot(100) -> 64 ReLU -> 4 logits     6,724 params
+                  critic: one-hot(100) -> 64 ReLU -> 1 value      6,529 params
+
+generalization    actor:  crop(340)    -> 64 ReLU -> 4 logits    22,084 params
+                  critic: crop(340)    -> 64 ReLU -> 1 value     21,889 params
+```
+
+The single-maze actor's 6,724 parameters match the single-maze DQN; the generalization actor's 22,084 match the layout-aware DQN.
+
+### What each piece is actually for
+
+A short map from machinery to the problem it solves, since PPO has more moving parts than DQN and it's easy to lose track of why:
+
+| Piece | Problem it solves |
+| --- | --- |
+| Stochastic policy | exploration, without an external epsilon schedule |
+| Critic + advantages | reduces gradient variance versus raw returns |
+| GAE `lambda` | dials the bias/variance tradeoff in the advantage estimate |
+| Importance ratio | lets one batch be reused for several gradient epochs |
+| Clipping | stops that reuse from moving the policy too far off-batch |
+| Entropy bonus | stops premature collapse to a deterministic policy |
+| Advantage normalization | keeps gradient scale stable across batches |
 
 ## Interactive controls
 
@@ -43,6 +266,8 @@ gcc -std=c11 -O2 -Wall -Wextra -pedantic src\main.c src\maze.c src\agent.c src\e
 | `+` / `-` | Adjust episodes trained per frame |
 
 Switching learners preserves both models, their episode counts, and their metrics. Demonstrations use `epsilon = 0` and never update the model or replay buffer.
+
+PPO is headless-only and does not appear in the interactive app. Its `learner.h`-incompatible shape (a sampled stochastic policy with no epsilon, trained on batched rollouts rather than one transition at a time) made an adapter more trouble than it was worth — see [`ppo_design.md`](ppo_design.md).
 
 ## Reproducible comparison
 
@@ -258,146 +483,32 @@ Both find the same optimal 14-step route on every seed. **DQN is ~2.9x more samp
 
 Comparison is on **environment steps, not episodes** — an episode means different amounts of experience to each algorithm, and one PPO update (a whole rollout, reused over 4 epochs) isn't comparable to one DQN update (a replay minibatch). "First greedy solve" is checkpointed every 2,048 steps for both, so it's a coarse measure; the ~3x gap far exceeds that granularity and holds on every seed, but the exact multiplier shouldn't be read too precisely.
 
-Applying PPO to the held-out generalization suite (rather than this single maze) is designed but not yet built — see `ppo_design.md` for the staging and the open questions.
+### PPO on the held-out generalization suite
 
-## Algorithms
-
-The complete training flow is available as a Graphviz diagram in [`assets/dqn_algorithm.dot`](assets/dqn_algorithm.dot). Render it after installing Graphviz with:
+`--ppo --generalize` runs the same PPO on the 34-maze generalization suite instead of the single maze, with the same `--random-goals` / `--min-separation` options the DQN experiments use.
 
 ```powershell
-dot -Tsvg assets/dqn_algorithm.dot -o assets/dqn_algorithm.svg
+.\maze_rl.exe --ppo --generalize --random-goals --min-separation 10 --steps 575000 --seeds 10 --seed 1 --csv ppo_generalization_sep10.csv
 ```
 
-Both agents receive exactly the same transition:
+Both algorithms share one implementation of the maze suite, the layout-aware encoding, and the step function (exposed from `generalization.c` through `generalization.h`) rather than each keeping a copy — a duplicated encoding that drifted even slightly would silently invalidate the comparison. PPO's actor is 22,084 parameters, matching the layout-aware DQN exactly. Budgets are matched on environment steps: the layout-aware DQN uses 574,926 steps for its 5,000 episodes at this setting, so PPO gets 575,000.
 
-```text
-(state, action, reward, next state, done)
-```
+Results over **20 seeds** (360 held-out evaluations per algorithm):
 
-They share the maze, rewards, 200-step episode limit, discount factor (`0.95`), and epsilon schedule (`1.0` decaying to `0.05`).
+| Algorithm | Parameters | Train-fit | Held-out |
+| --- | ---: | ---: | ---: |
+| DQN layout MLP | 22,084 | 49.1% | 8.9% (32/360) |
+| DQN conv (10 seeds) | 13,624 | 25.6% | 5.0% (9/180) |
+| DQN wide conv (10 seeds) | 21,809 | 45.0% | 5.6% (10/180) |
+| **PPO layout** | **22,084** | **49.4%** | **18.3% (66/360)** |
 
-The tabular update is:
+**PPO roughly doubles DQN's held-out success at essentially identical train-fit** (49.4% vs 49.1%) — so this is not a difference in how well each fits its training data, it's a difference in what transfers. It comes from changing the *algorithm* while holding architecture, observation, environment, distribution and step budget fixed.
 
-```text
-Q(s,a) <- Q(s,a) + alpha * [r + gamma * max Q(s',a') - Q(s,a)]
-```
+The evidence is solid at this sample size: per-seed head-to-head is **PPO 12 wins, DQN 4, 4 ties**; median 3.5 vs 1.5; a paired test across seeds gives **t = 3.41 (df = 19), p ≈ 0.003**; and the gap survives dropping each side's best seed (17.0% vs 7.6%). Notably the effect got *stronger* going from 10 to 20 seeds (t rose from 1.93 to 3.41), which is what a real effect does and noise generally doesn't.
 
-The DQN uses:
+PPO also reproduces the shortcut finding independently: its train-fit falls from 95.0% on fixed corners to 46.2% with random goals, while held-out stays flat or slightly rises (16.7% to 18.3%) — the same pattern the DQN experiments found, in a different algorithm. (The fixed-corner PPO row is *not* budget-matched — the fixed-corner DQN run uses only 232,395 steps — so it's recorded for completeness, not comparison.)
 
-- a 100-element one-hot state input
-- a `100 -> 64 ReLU -> 4` network (6,724 trainable parameters)
-- He weight initialization
-- a 10,000-transition circular replay buffer
-- 500-transition warm-up and 32-transition minibatches
-- Huber loss and Adam with learning rate `0.001`
-- gradient-norm clipping at `10`
-- a target network copied every 250 optimizer updates
-
-One-hot input makes the baseline honest: it gives DQN the same state identity used by the Q-table without pretending flattened state numbers have meaningful numeric distance.
-
-## Summary of mathematical formalisms
-
-Let `s_t` be the current state, `a_t` one of the four actions in the action set, `theta` the online-network parameters, and `theta_target` (written `theta^-` below) the target-network parameters.
-
-### Epsilon-greedy action selection
-
-Exploration samples an action uniformly; exploitation selects an action with maximum online-network value. The implementation randomly selects among exact maximizing ties:
-
-```text
-a_t = uniform random action                          if u < epsilon
-a_t = random member of argmax_a Q(s_t, a; theta)      if u >= epsilon
-
-  where u ~ Uniform[0, 1)
-```
-
-### Bellman optimality target
-
-For replay transition `j`, let `d_j = 1` indicate termination. The fixed target-network value is:
-
-```text
-y_j = r_j                                             if d_j = 1
-y_j = r_j + gamma * max_a' Q(s'_j, a'; theta^-)       if d_j = 0
-
-  where gamma = 0.95
-```
-
-The terminal branch deliberately contains no future value because no action occurs after reaching the goal.
-
-### Minibatch Huber loss
-
-For a uniformly sampled replay minibatch `B` of size 32, define the temporal-difference error `e_j = y_j - Q(s_j, a_j; theta)`. The implementation uses Huber loss with threshold 1:
-
-```text
-Huber_1(e) = 0.5 * e^2      if |e| <= 1
-Huber_1(e) = |e| - 0.5      if |e| > 1
-
-L(theta) = (1 / |B|) * sum_over_j_in_B( Huber_1(y_j - Q(s_j, a_j; theta)) )
-  where |B| = 32
-```
-
-### Gradient clipping and optimization
-
-The minibatch gradient is clipped to Euclidean norm 10, then passed to Adam:
-
-```text
-g = gradient of L(theta) with respect to theta
-
-g_clipped = g                       if ||g||_2 <= 10
-g_clipped = 10 * g / ||g||_2        if ||g||_2 > 10
-
-theta <- Adam(theta, g_clipped; alpha=1e-3, beta1=0.9, beta2=0.999, epsilon_adam=1e-8)
-```
-
-### Periodic target-network copy
-
-The target is held fixed between hard synchronization steps:
-
-```text
-theta^- <- theta      every C = 250 optimizer updates
-```
-
-### Exploration schedule
-
-After each training episode:
-
-```text
-epsilon <- max(epsilon_min, epsilon * lambda_epsilon)
-
-  lambda_epsilon = 0.995
-  epsilon_min    = 0.05
-  epsilon_0      = 1.0   (starting value)
-```
-
-### Network equations and tensor dimensions
-
-For one-hot state vector `x(s)` in `R^100`:
-
-```text
-h = ReLU(W1 * x(s) + b1)
-Q(s, .; theta) = W2 * h + b2
-
-  W1 in R^(64x100),  b1 in R^64,  W2 in R^(4x64),  b2 in R^4
-```
-
-Therefore the online network contains exactly:
-
-```text
-(64 * 100) + 64 + (4 * 64) + 4 = 6,724
-```
-
-Thus, the online network has **6,724 trainable parameters**.
-
-Weights use He initialization with variance `2 / n_in`:
-
-```text
-W_ij ~ Normal(0, 2 / n_in)
-```
-
-After the online weights are initialized, the target network begins as an exact copy of the online network:
-
-```text
-theta^- <- theta
-```
+See `ppo_design.md` for the staging, self-tests and open questions.
 
 ## Tests
 
@@ -405,21 +516,37 @@ theta^- <- theta
 make test
 ```
 
-Tests cover environment transitions, replay wraparound, terminal targets, target copying, a finite-difference gradient check, deterministic tabular training, parameter counts, and end-to-end learning of the known optimal 14-action route by both agents.
+Everything is checked in one pass, including the hand-written backpropagation.
+
+Shared and DQN-side coverage: environment transitions, replay wraparound, terminal targets, target-network copying, deterministic tabular training, parameter counts, procedural maze solvability, and end-to-end learning of the known optimal 14-action route by both the tabular and DQN agents. Finite-difference gradient checks cover the convolutional and wide-convolutional DQN models.
+
+PPO-side coverage, since hand-rolled policy gradients are easy to get subtly wrong:
+
+- finite-difference gradient checks for the actor and the critic, on both the one-hot and the dense 340-input networks, probing an output-layer *and* a hidden-layer weight each so an error in either backprop stage is caught
+- GAE reduces to the one-step TD residual at `lambda = 0` and to the discounted return at `lambda = 1`, and does not chain advantage across an episode boundary
+- softmax/log-prob consistency, including stability with logits large enough to overflow a naive `exp`, and uniform entropy equal to `log(4)`
+- the clipped branch contributes exactly zero policy gradient while the unclipped branch does not
+- determinism: the same seed produces bit-identical networks after a full collect/GAE/train cycle
+- parameter counts asserted against their DQN counterparts (6,724 and 22,084)
 
 ## Source layout
 
 ```text
 src/
-|-- main.c              Interactive UI and command-line dispatch
-|-- environment.c/.h   Shared rewards and transitions
-|-- learner.c/.h       Common learner interface
-|-- tabular.c/.h       Tabular Q-learning
-|-- dqn.c/.h           Neural network, replay, target network, and Adam
-|-- trainer.c/.h       Shared episode and metric logic
-|-- benchmark.c/.h     Seeded headless comparison and CSV export
-|-- generalization.c/.h  Multi-maze and cross-size held-out experiment
-|-- rng.c/.h           Deterministic project RNG
-|-- maze.c/.h          Maze state and rendering
-`-- agent.c/.h         Movement and model-independent visualization
+|-- main.c               Interactive UI and command-line dispatch
+|-- environment.c/.h     Shared rewards and transitions
+|-- learner.c/.h         Common learner interface (tabular and DQN)
+|-- tabular.c/.h         Tabular Q-learning
+|-- dqn.c/.h             Neural network, replay, target network, and Adam
+|-- ppo.c/.h             PPO: actor/critic, rollouts, GAE, clipped objective
+|-- trainer.c/.h         Shared episode and metric logic
+|-- benchmark.c/.h       Seeded headless comparison and CSV export
+|-- generalization.c/.h  Multi-maze held-out experiment; also exports the
+|                          shared maze suite, layout encoding and step
+|                          function that PPO evaluates against
+|-- rng.c/.h             Deterministic project RNG
+|-- maze.c/.h            Maze state and rendering
+`-- agent.c/.h           Movement and model-independent visualization
 ```
+
+`ppo.c` is self-contained rather than implementing `learner.h`, for the reasons in [`ppo_design.md`](ppo_design.md). It shares the *environment* with the DQN experiments (through `generalization.h`) but not the learner interface — so both algorithms provably see identical mazes, observations and dynamics, while each keeps the training loop its own paradigm needs.

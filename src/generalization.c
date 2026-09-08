@@ -10,21 +10,14 @@
 #include <string.h>
 #include <time.h>
 
-#define GEN_MAX_SIZE 12
-#define GEN_MAX_CELLS (GEN_MAX_SIZE * GEN_MAX_SIZE)
-#define GEN_ACTIONS 4
-#define GEN_TRAIN_MAZES 16
-#define GEN_TEST_PER_GROUP 6
+/* Maze geometry, observation shape and suite sizing now live in
+   generalization.h, shared with the other algorithms evaluated on this
+   suite. Everything below is specific to the DQN experiments. */
 #define GEN_POOL_CAP 256
-#define GEN_MAZE_COUNT (GEN_TRAIN_MAZES + 3 * GEN_TEST_PER_GROUP)
 #define GEN_REPLAY_CAPACITY 10000
 #define GEN_REPLAY_WARMUP 500
 #define GEN_BATCH_SIZE 32
 #define GEN_TARGET_SYNC 250
-#define GEN_MAX_STEPS 200
-#define GEN_CROP_RADIUS 6
-#define GEN_CROP_SIDE (2 * GEN_CROP_RADIUS + 1)
-#define GEN_LAYOUT_INPUT (2 * GEN_CROP_SIDE * GEN_CROP_SIDE + 2)
 #define GEN_POSITION_INPUT GEN_MAX_CELLS
 #define GEN_MAX_INPUT GEN_LAYOUT_INPUT
 #define GEN_MAX_HIDDEN 64
@@ -62,27 +55,8 @@ typedef enum {
     OBS_CONV_WIDE
 } ObservationKind;
 
-typedef struct {
-    int width;
-    int height;
-    unsigned char wall[GEN_MAX_CELLS];
-    int startState;
-    int goalState;
-    int optimalSteps;
-    uint64_t generationSeed;
-    const char *split;
-    char name[32];
-} ExperimentMaze;
-
-/* Everything Encode()/ForwardState() need to observe a maze, decoupled from
-   the fixed ExperimentMaze suite so a freshly generated procedural maze can
-   be observed the same way as one of the deterministic held-out mazes. */
-typedef struct {
-    int width;
-    int height;
-    unsigned char wall[GEN_MAX_CELLS];
-    int goalState;
-} GenMazeView;
+/* ExperimentMaze and GenMazeView are defined in generalization.h, shared
+   with the other algorithms evaluated on this suite. */
 
 typedef struct {
     GenMazeView maze;
@@ -488,18 +462,16 @@ static int WideConvOutputBiasesOffset(void)
 }
 static int WideConvParameterCount(void) { return WideConvOutputBiasesOffset() + GEN_ACTIONS; }
 
-static void Encode(
-    const GenDqn *dqn,
+/* Agent-centered crop with wall and goal planes plus normalized goal
+   displacement. Split out from Encode so the identical encoding can be
+   handed to other algorithms through GenEncodeLayout, rather than each one
+   growing its own copy that could silently drift. Assumes `output` is
+   already zeroed. */
+static void EncodeLayoutInto(
     const GenMazeView *maze,
     int state,
-    float output[GEN_MAX_INPUT])
+    float *output)
 {
-    memset(output, 0, sizeof(float) * (size_t)dqn->inputSize);
-    if (dqn->observation == OBS_POSITION) {
-        output[state] = 1.0f;
-        return;
-    }
-
     int agentX = StateX(state);
     int agentY = StateY(state);
     int goalX = StateX(maze->goalState);
@@ -519,6 +491,20 @@ static void Encode(
     }
     output[2 * plane] = (float)(goalX - agentX) / (GEN_MAX_SIZE - 1);
     output[2 * plane + 1] = (float)(goalY - agentY) / (GEN_MAX_SIZE - 1);
+}
+
+static void Encode(
+    const GenDqn *dqn,
+    const GenMazeView *maze,
+    int state,
+    float output[GEN_MAX_INPUT])
+{
+    memset(output, 0, sizeof(float) * (size_t)dqn->inputSize);
+    if (dqn->observation == OBS_POSITION) {
+        output[state] = 1.0f;
+        return;
+    }
+    EncodeLayoutInto(maze, state, output);
 }
 
 static void ForwardMlp(
@@ -1560,7 +1546,9 @@ static int RunOne(
         groupSuccess[2], groupTotal[2], groupSuccess[3], groupTotal[3]);
     if (options->procedural || options->randomGoals)
         printf(" pool_fit=%d/%d", poolSuccess, poolCount);
-    printf(" time=%.0fms\n", elapsed);
+    /* Environment steps, so this run can be budget-matched against an
+       algorithm whose natural unit is not episodes (see ppo.c). */
+    printf(" env_steps=%d time=%.0fms\n", dqn.environmentSteps, elapsed);
     DestroyDqn(&dqn);
     return 0;
 }
@@ -2011,4 +1999,44 @@ bool GeneralizationRunSelfTests(void)
     DestroyDqn(&videoDqn);
     if (!trajectoryValid || !frozen) return false;
     return true;
+}
+
+/* ---------- shared environment surface ----------
+
+   Thin wrappers over the internals above, so another algorithm (currently
+   PPO) can train and be evaluated on exactly this suite, with exactly this
+   observation encoding and exactly these dynamics. Deliberately wrappers
+   rather than renamed internals: the DQN experiment's call sites stay
+   untouched, so its published results remain bit-for-bit reproducible. */
+
+void GenBuildMazeSuite(ExperimentMaze mazes[GEN_MAZE_COUNT], uint64_t suiteSeed)
+{
+    BuildMazeSuite(mazes, suiteSeed);
+}
+
+GenMazeView GenViewOfMaze(const ExperimentMaze *maze)
+{
+    return ViewOfMaze(maze);
+}
+
+void GenEncodeLayout(const GenMazeView *maze, int state, float output[GEN_LAYOUT_INPUT])
+{
+    memset(output, 0, sizeof(float) * GEN_LAYOUT_INPUT);
+    EncodeLayoutInto(maze, state, output);
+}
+
+GenStepOutcome GenStep(const GenMazeView *maze, int state, Action action)
+{
+    GenTransition transition = TakeStep(maze, state, action);
+    return (GenStepOutcome){transition.nextState, transition.reward, transition.done};
+}
+
+void GenRandomizeStartGoal(
+    const ExperimentMaze *maze,
+    int *startState,
+    int *goalState,
+    int minSeparation,
+    Rng *rng)
+{
+    RandomizeStartGoal(maze, startState, goalState, minSeparation, rng);
 }
