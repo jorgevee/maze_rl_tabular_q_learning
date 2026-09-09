@@ -238,7 +238,7 @@ The single-maze actor's 6,724 parameters match the single-maze DQN; the generali
 
 ### What each piece is actually for
 
-A short map from machinery to the problem it solves, since PPO has more moving parts than DQN and it's easy to lose track of why:
+A short map from machinery to the problem it solves, since PPO has more moving parts than DQN and it's easy to lose track of why. Each of these claims is tested empirically in [PPO ablations](#ppo-ablations-what-each-component-actually-does) further below — two of them turned out to be inert at the default settings.
 
 | Piece | Problem it solves |
 | --- | --- |
@@ -509,6 +509,63 @@ The evidence is solid at this sample size: per-seed head-to-head is **PPO 12 win
 PPO also reproduces the shortcut finding independently: its train-fit falls from 95.0% on fixed corners to 46.2% with random goals, while held-out stays flat or slightly rises (16.7% to 18.3%) — the same pattern the DQN experiments found, in a different algorithm. (The fixed-corner PPO row is *not* budget-matched — the fixed-corner DQN run uses only 232,395 steps — so it's recorded for completeness, not comparison.)
 
 See `ppo_design.md` for the staging, self-tests and open questions.
+
+### PPO ablations: what each component actually does
+
+The [PPO essentials](#ppo-essentials) section claims each piece of machinery solves a particular problem. These ablations test those claims by removing or varying each one. Hyperparameters are exposed as flags (`--epochs`, `--clip-eps`, `--gae-lambda`, `--entropy-coef`, `--lr`) and a run whose settings differ from the defaults labels itself in the CSV.
+
+**Data reuse (`--epochs K`) is where the sample efficiency comes from.** Single maze, 10 seeds:
+
+| K | Steps to first solve | clip_fraction | Wall clock |
+| ---: | ---: | ---: | ---: |
+| 1 (no reuse) | 44,442 | 0.000 | 39 ms |
+| 4 (default) | 13,312 | 0.012 | 119 ms |
+| 10 | 7,578 | 0.039 | 282 ms |
+| 20 | 6,963 | 0.061 | 550 ms |
+
+K=1 is essentially vanilla policy gradient and needs **6.4x the environment steps** of K=20. Returns diminish sharply past K=10 (8% better for 2x the compute). `clip_fraction` is *exactly* 0.000 at K=1, as it must be — on the only pass the ratio is identically 1, so clipping cannot bind. A free correctness check.
+
+**Clipping does nothing until updates are aggressive — then it prevents total collapse.** Disabling it (`--clip-eps 1000`) at the default learning rate changes nothing at any K. Sweeping the learning rate at K=10, measuring whether the *final* policy still solves the maze:
+
+| Learning rate | Clipping on | Clipping off | Final entropy (off) |
+| ---: | ---: | ---: | ---: |
+| 0.0003 (default) | 10/10 | 10/10 | 0.008 |
+| 0.003 | 9/10 | **2/10** | 0.024 |
+| 0.01 | 7/10 | **0/10** | **0.000** |
+
+At lr=0.01 without clipping, final entropy is exactly 0.000 on all ten seeds — complete policy collapse. Seven of those seeds *did* find the goal early and then destroyed their own policy: the unclipped objective kept raising the winning action's probability during batch reuse until nothing else could be sampled, and a deterministic policy on a wrong action cannot explore back out. This is precisely the failure the clipped objective exists to prevent.
+
+**GAE `lambda` must be high here — and the single-maze answer is the opposite of the real one.** On one fixed maze, low lambda wins monotonically across eight values (λ=0 solves in 10,240 steps vs λ=1.0's 15,974; slower on 9/10 seeds, paired t=3.63). On the generalization suite that reverses completely:
+
+| lambda | Train-fit | Held-out |
+| ---: | ---: | ---: |
+| 0 | 0.6% | **0.0%** |
+| 0.5 | 21.9% | 10.6% |
+| 0.95 (default) | 46.2% | 18.3% |
+| 1.0 | 37.5% | 22.8% |
+
+λ=0 — the *best* single-maze setting — learns essentially nothing on the real task. Low lambda means trusting the critic; on one fixed maze the critic can be accurate, but across 16 mazes with randomized goals it is badly wrong early, and λ=0 leans entirely on it. (λ=1.0 over the 0.95 default is **not** established: t=0.68. Leave the default alone.)
+
+**The entropy bonus is load-bearing because exploration is the bottleneck.** Generalization suite, 10 seeds:
+
+| c_ent | Train-fit | Held-out | Seeds learning nothing |
+| ---: | ---: | ---: | ---: |
+| 0 | 20.0% | 8.9% | **5 of 10** |
+| 0.01 (default) | 46.2% | 18.3% | 1 of 10 |
+| 0.05 | 61.9% | 20.0% | **0 of 10** |
+
+Without the bonus, half the seeds finish having learned nothing (0/16 train-fit; paired t=5.09 for 0 vs 0.05). With goals randomized at separation ≥10 the goal is far away, so a policy that collapses early stops finding it, never receives the +100, and has nothing to learn from. This also explains why *more* exploration pressure **raises** training fit rather than trading against it.
+
+### A caveat that applies to every number above
+
+Every result in this README was scored against the **same 18 held-out mazes**, generated from one hardcoded suite seed. No gradient ever touched them, but roughly 20 configurations have now been compared on them and the best kept — which makes the suite a validation set in practice, and any selected winner optimistically biased.
+
+Measured from the observed per-seed spread, a 10-seed held-out mean carries **±4.1 percentage points** of standard error, and picking the best of 20 equally-good configurations inflates the winner by **~7.7 pp** on average.
+
+- **Robust to this:** PPO vs DQN (9.4 pp, a single pre-specified comparison at 20 seeds, p≈0.003, strengthening as seeds were added), and the large qualitative results — λ=0 failing outright, clipping preventing collapse, half the seeds learning nothing without entropy.
+- **Not robust:** any "new best" worth a few points that was *selected* from a sweep. λ=1.0's 22.8% is exactly the shape of number this manufactures for free, which is why it is not claimed over the default.
+
+The suite seed has also never been varied, so strictly these are statements about *these 34 mazes*. The fix — re-running the headline comparisons on several freshly generated suites — is the highest-value outstanding experiment in the project and has not been done.
 
 ## Tests
 

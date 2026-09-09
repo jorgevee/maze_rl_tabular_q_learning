@@ -54,7 +54,15 @@ generalization_random_goals_sep10_wideconv_10seed.csv
 generalization_random_goals_sep12_10seed.csv
 generalization_random_goals_sep14_10seed.csv
 ppo.csv
+Maze_RL_Report.docx
 ppo_generalization_fixed.csv
+ppo_ent_0.csv
+ppo_ent_0.001.csv
+ppo_ent_0.05.csv
+ppo_gae_0.csv
+ppo_gae_0.5.csv
+ppo_gae_0.95.csv
+ppo_gae_1.0.csv
 ppo_generalization_sep10.csv
 ppo_generalization_sep10_s11.csv
 generalization_random_goals_sep10_s11.csv

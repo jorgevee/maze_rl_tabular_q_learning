@@ -743,7 +743,8 @@ static void AccumulateGenActorGradient(
     const PpoConfig *config,
     float scale,
     GenActorNetwork *gradient,
-    float *entropyOut)
+    float *entropyOut,
+    bool *clippedOut)
 {
     float hidden[PPO_HIDDEN];
     float logits[ACTION_COUNT];
@@ -756,7 +757,8 @@ static void AccumulateGenActorGradient(
     float clipped = ClipRatio(ratio, config->clipEpsilon);
     float surrogate1 = ratio * advantage;
     float surrogate2 = clipped * advantage;
-    float objectiveGradient = surrogate1 <= surrogate2 ? ratio * advantage : 0.0f;
+    bool useUnclipped = surrogate1 <= surrogate2;
+    float objectiveGradient = useUnclipped ? ratio * advantage : 0.0f;
     float entropy = PolicyEntropy(probabilities, logProbabilities);
 
     float logitGradient[ACTION_COUNT];
@@ -786,6 +788,7 @@ static void AccumulateGenActorGradient(
     }
 
     if (entropyOut) *entropyOut = entropy;
+    if (clippedOut) *clippedOut = !useUnclipped;
 }
 
 static float GenCriticLossFor(
@@ -944,6 +947,7 @@ static void TrainOnGenRollout(GenPpoAgent *agent, Rng *rng, PpoBatchStats *stats
 
     double entropySum = 0.0;
     double valueLossSum = 0.0;
+    long clippedCount = 0;
     long sampleCount = 0;
 
     GenActorNetwork *actorGradient = malloc(sizeof(GenActorNetwork));
@@ -975,13 +979,15 @@ static void TrainOnGenRollout(GenPpoAgent *agent, Rng *rng, PpoBatchStats *stats
             for (int index = start; index < end; index++) {
                 GenPpoStep *step = &agent->steps[order[index]];
                 float entropy = 0.0f;
+                bool wasClipped = false;
                 AccumulateGenActorGradient(&agent->actor, step, step->advantage,
-                    &agent->config, scale, actorGradient, &entropy);
+                    &agent->config, scale, actorGradient, &entropy, &wasClipped);
                 float valueLoss = 0.0f;
                 AccumulateGenCriticGradient(&agent->critic, step->observation,
                     step->target, scale, criticGradient, &valueLoss);
                 entropySum += entropy;
                 valueLossSum += valueLoss;
+                if (wasClipped) clippedCount++;
                 sampleCount++;
             }
 
@@ -1005,7 +1011,7 @@ static void TrainOnGenRollout(GenPpoAgent *agent, Rng *rng, PpoBatchStats *stats
     if (stats && sampleCount > 0) {
         stats->entropy = (float)(entropySum / (double)sampleCount);
         stats->valueLoss = (float)(valueLossSum / (double)sampleCount);
-        stats->clipFraction = 0.0f;
+        stats->clipFraction = (float)((double)clippedCount / (double)sampleCount);
     }
 }
 
@@ -1045,11 +1051,43 @@ typedef struct {
     bool generalize;
     bool randomGoals;
     int minSeparation;
+    /* Hyperparameters, overridable from the command line so PPO's components
+       can be swept and ablated without recompiling. */
+    PpoConfig config;
 } PpoOptions;
 
 static PpoOptions DefaultPpoOptions(void)
 {
-    return (PpoOptions){200000, 5, 1, "ppo.csv", false, false, false, 0};
+    PpoOptions options = {200000, 5, 1, "ppo.csv", false, false, false, 0,
+        DefaultPpoConfig()};
+    return options;
+}
+
+/* Compact label naming any hyperparameter that differs from the defaults, so
+   sweep runs are self-identifying in the CSV. Empty when everything is
+   default, which keeps previously generated files comparable. */
+static void DescribePpoConfig(const PpoConfig *config, char *out, size_t size)
+{
+    PpoConfig base = DefaultPpoConfig();
+    char buffer[160];
+    int used = 0;
+    buffer[0] = '\0';
+    if (config->epochs != base.epochs)
+        used += snprintf(buffer + used, sizeof(buffer) - (size_t)used,
+            "_K%d", config->epochs);
+    if (config->clipEpsilon != base.clipEpsilon)
+        used += snprintf(buffer + used, sizeof(buffer) - (size_t)used,
+            "_clip%.2f", (double)config->clipEpsilon);
+    if (config->lambda != base.lambda)
+        used += snprintf(buffer + used, sizeof(buffer) - (size_t)used,
+            "_lam%.2f", (double)config->lambda);
+    if (config->entropyCoefficient != base.entropyCoefficient)
+        used += snprintf(buffer + used, sizeof(buffer) - (size_t)used,
+            "_ent%.4f", (double)config->entropyCoefficient);
+    if (config->learningRate != base.learningRate)
+        snprintf(buffer + used, sizeof(buffer) - (size_t)used,
+            "_lr%.5f", (double)config->learningRate);
+    snprintf(out, size, "%s", buffer);
 }
 
 static bool ParsePpoPositive(const char *text, int *value)
@@ -1058,6 +1096,15 @@ static bool ParsePpoPositive(const char *text, int *value)
     long parsed = strtol(text, &end, 10);
     if (end == text || *end != '\0' || parsed < 1 || parsed > 100000000) return false;
     *value = (int)parsed;
+    return true;
+}
+
+static bool ParsePpoFloat(const char *text, float low, float high, float *value)
+{
+    char *end = NULL;
+    double parsed = strtod(text, &end);
+    if (end == text || *end != '\0' || parsed < low || parsed > high) return false;
+    *value = (float)parsed;
     return true;
 }
 
@@ -1087,6 +1134,23 @@ static bool ParsePpoOptions(int argc, char **argv, PpoOptions *options)
             if (end == argv[index] || *end != '\0' || parsed < 0 || parsed > 1000)
                 return false;
             options->minSeparation = (int)parsed;
+        } else if (strcmp(argv[index], "--epochs") == 0 && index + 1 < argc) {
+            if (!ParsePpoPositive(argv[++index], &options->config.epochs)) return false;
+            if (options->config.epochs > 64) return false;
+        } else if (strcmp(argv[index], "--clip-eps") == 0 && index + 1 < argc) {
+            /* A very large value effectively disables clipping: the ratio can
+               never leave [1-eps, 1+eps], so the clipped branch never binds. */
+            if (!ParsePpoFloat(argv[++index], 0.0f, 1000.0f, &options->config.clipEpsilon))
+                return false;
+        } else if (strcmp(argv[index], "--gae-lambda") == 0 && index + 1 < argc) {
+            if (!ParsePpoFloat(argv[++index], 0.0f, 1.0f, &options->config.lambda))
+                return false;
+        } else if (strcmp(argv[index], "--entropy-coef") == 0 && index + 1 < argc) {
+            if (!ParsePpoFloat(argv[++index], 0.0f, 10.0f,
+                &options->config.entropyCoefficient)) return false;
+        } else if (strcmp(argv[index], "--lr") == 0 && index + 1 < argc) {
+            if (!ParsePpoFloat(argv[++index], 1.0e-6f, 1.0f,
+                &options->config.learningRate)) return false;
         } else return false;
     }
     /* The start/goal options only mean anything on the multi-maze suite, and
@@ -1104,7 +1168,9 @@ static int RunPpoSeed(FILE *csv, const PpoOptions *options, uint64_t seed)
     RngSeed(&rng, seed ^ UINT64_C(0x5052504f));
     PpoAgent *agent = malloc(sizeof(PpoAgent));
     if (!agent) return 1;
-    InitializeAgentNetworks(agent, DefaultPpoConfig(), &rng);
+    InitializeAgentNetworks(agent, options->config, &rng);
+    char configLabel[64];
+    DescribePpoConfig(&options->config, configLabel, sizeof(configLabel));
 
     clock_t start = clock();
     int firstSolvedStep = -1;
@@ -1123,7 +1189,8 @@ static int RunPpoSeed(FILE *csv, const PpoOptions *options, uint64_t seed)
         float meanReturn = agent->completedEpisodes > 0 ?
             agent->completedReturnSum / (float)agent->completedEpisodes : 0.0f;
 
-        fprintf(csv, "ppo,%llu,%d,%d,%d,%d,%.1f,%.2f,%d,%d,%.4f,%.4f,%.4f,%.3f\n",
+        fprintf(csv, "ppo%s,%llu,%d,%d,%d,%d,%.1f,%.2f,%d,%d,%.4f,%.4f,%.4f,%.3f\n",
+            configLabel,
             (unsigned long long)seed,
             agent->environmentSteps,
             agent->actorUpdates,
@@ -1172,7 +1239,7 @@ static int RunDqnBaselineSeed(FILE *csv, const PpoOptions *options, uint64_t see
     Rng evaluationRng;
     clock_t start = clock();
 
-    const int checkpointInterval = DefaultPpoConfig().rolloutSteps;
+    const int checkpointInterval = options->config.rolloutSteps;
     int environmentSteps = 0;
     int nextCheckpoint = checkpointInterval;
     int firstSolvedStep = -1;
@@ -1244,11 +1311,13 @@ static int RunGenPpoSeed(
     GenPpoAgent *agent = malloc(sizeof(GenPpoAgent));
     if (!agent) return 1;
     memset(agent, 0, sizeof(*agent));
-    agent->config = DefaultPpoConfig();
+    agent->config = options->config;
     InitializeGenActor(&agent->actor, &rng);
     InitializeGenCritic(&agent->critic, &rng);
     StartGenEpisode(agent, mazes, options->randomGoals, options->minSeparation, &rng);
 
+    char configLabel[64];
+    DescribePpoConfig(&options->config, configLabel, sizeof(configLabel));
     char trainMode[32];
     if (options->randomGoals && options->minSeparation > 0) {
         snprintf(trainMode, sizeof(trainMode), "fixed_%d_random_goals_sep%d",
@@ -1274,8 +1343,9 @@ static int RunGenPpoSeed(
         EpisodeResult evaluation = EvaluateGenGreedy(agent, &mazes[mazeIndex]);
         const ExperimentMaze *maze = &mazes[mazeIndex];
         int gap = evaluation.reachedGoal ? evaluation.steps - maze->optimalSteps : -1;
-        fprintf(csv, "%llu,ppo_layout,%s,%s,%s,%llu,%dx%d,%d,%d,%d,%d,%.1f,%.3f,%d\n",
+        fprintf(csv, "%llu,ppo_layout%s,%s,%s,%s,%llu,%dx%d,%d,%d,%d,%d,%.1f,%.3f,%d\n",
             (unsigned long long)seed,
+            configLabel,
             trainMode,
             maze->split,
             maze->name,
@@ -1296,8 +1366,9 @@ static int RunGenPpoSeed(
         if (evaluation.reachedGoal) groupSuccess[group]++;
     }
 
-    printf("seed=%llu algorithm=ppo_layout train_mode=%s steps=%d train=%d/%d same=%d/%d smaller=%d/%d larger=%d/%d time=%.0fms\n",
+    printf("seed=%llu algorithm=ppo_layout%s train_mode=%s steps=%d train=%d/%d same=%d/%d smaller=%d/%d larger=%d/%d time=%.0fms\n",
         (unsigned long long)seed,
+        configLabel,
         trainMode,
         agent->environmentSteps,
         groupSuccess[0], groupTotal[0], groupSuccess[1], groupTotal[1],
@@ -1634,7 +1705,8 @@ static bool GenGradientSelfTest(void)
     PpoConfig config = DefaultPpoConfig();
 
     memset(actorGradient, 0, sizeof(*actorGradient));
-    AccumulateGenActorGradient(actor, step, advantage, &config, 1.0f, actorGradient, NULL);
+    AccumulateGenActorGradient(actor, step, advantage, &config, 1.0f, actorGradient,
+        NULL, NULL);
     /* Probe an input weight on a channel the observation actually activates,
        plus an output weight, covering both backprop stages. */
     int activeInput = -1;
