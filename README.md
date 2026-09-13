@@ -14,7 +14,10 @@ A native C and raylib teaching project that walks the same maze problem up three
      issue or PR comment, then paste the resulting https://github.com/user-attachments/assets/...
      URL on its own line in place of the link below. Repo-relative paths do not autoplay. -->
 
-**[▶ Watch the demo (51s)](assets/ppo_generalization.mp4)** — PPO training live, then greedy rollouts on training mazes, on unseen mazes, and on one it fails. Regenerate with `make ppo-demo-video`.
+**[▶ Watch the demo (51s)]** — PPO training live, then greedy rollouts on training mazes, on unseen mazes, and on one it fails. 
+
+https://github.com/user-attachments/assets/6569d253-5d22-47de-979f-c08835487a53
+
 
 ## Build and run
 
