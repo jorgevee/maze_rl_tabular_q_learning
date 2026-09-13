@@ -6,6 +6,7 @@
 #include "environment.h"
 #include "generalization.h"
 #include "ppo.h"
+#include "render3d.h"
 #include "tabular.h"
 #include "trainer.h"
 #include <stdio.h>
@@ -51,6 +52,8 @@ int main(int argc, char **argv)
         return RunGeneralizationVideo(argc, argv);
     if (argc > 1 && strcmp(argv[1], "--ppo") == 0)
         return RunPpoExperiment(argc, argv);
+    if (argc > 1 && strcmp(argv[1], "--render3d") == 0)
+        return RunRender3D(argc, argv);
     BenchmarkOptions benchmark;
     if (argc > 1) {
         if (!ParseBenchmarkOptions(argc, argv, &benchmark)) {

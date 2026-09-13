@@ -3,6 +3,7 @@
 #include "dqn.h"
 #include "environment.h"
 #include "generalization.h"
+#include "mazesuite.h"
 #include "learner.h"
 #include "maze.h"
 #include "rl.h"
@@ -96,6 +97,7 @@ typedef struct {
     float entropy;
     float valueLoss;
     float clipFraction;
+    float approxKl;
 } PpoBatchStats;
 
 static PpoConfig DefaultPpoConfig(void)
@@ -744,7 +746,8 @@ static void AccumulateGenActorGradient(
     float scale,
     GenActorNetwork *gradient,
     float *entropyOut,
-    bool *clippedOut)
+    bool *clippedOut,
+    float *klOut)
 {
     float hidden[PPO_HIDDEN];
     float logits[ACTION_COUNT];
@@ -753,7 +756,8 @@ static void AccumulateGenActorGradient(
     float logProbabilities[ACTION_COUNT];
     PolicyDistribution(logits, probabilities, logProbabilities);
 
-    float ratio = expf(logProbabilities[step->action] - step->logProbOld);
+    float logRatio = logProbabilities[step->action] - step->logProbOld;
+    float ratio = expf(logRatio);
     float clipped = ClipRatio(ratio, config->clipEpsilon);
     float surrogate1 = ratio * advantage;
     float surrogate2 = clipped * advantage;
@@ -789,6 +793,8 @@ static void AccumulateGenActorGradient(
 
     if (entropyOut) *entropyOut = entropy;
     if (clippedOut) *clippedOut = !useUnclipped;
+    /* k3 estimator, non-negative by construction. */
+    if (klOut) *klOut = (ratio - 1.0f) - logRatio;
 }
 
 static float GenCriticLossFor(
@@ -867,11 +873,11 @@ static void StartGenEpisode(
     Rng *rng)
 {
     int mazeIndex = RngRange(rng, GEN_TRAIN_MAZES);
-    agent->currentMaze = GenViewOfMaze(&mazes[mazeIndex]);
+    agent->currentMaze = ViewOfMaze(&mazes[mazeIndex]);
     if (randomGoals) {
         int randomStart;
         int randomGoal;
-        GenRandomizeStartGoal(&mazes[mazeIndex], &randomStart, &randomGoal,
+        RandomizeStartGoal(&mazes[mazeIndex], &randomStart, &randomGoal,
             minSeparation, rng);
         agent->currentMaze.goalState = randomGoal;
         agent->currentState = randomStart;
@@ -896,7 +902,7 @@ static void CollectGenRollout(
 
     for (int index = 0; index < agent->config.rolloutSteps; index++) {
         GenPpoStep *step = &agent->steps[agent->stepCount++];
-        GenEncodeLayout(&agent->currentMaze, agent->currentState, step->observation);
+        EncodeLayout(&agent->currentMaze, agent->currentState, step->observation);
 
         float actorHidden[PPO_HIDDEN];
         float logits[ACTION_COUNT];
@@ -909,7 +915,7 @@ static void CollectGenRollout(
         float criticHidden[PPO_HIDDEN];
         float value = GenCriticForward(&agent->critic, step->observation, criticHidden);
 
-        GenStepOutcome outcome = GenStep(&agent->currentMaze, agent->currentState, action);
+        GenStepOutcome outcome = StepMaze(&agent->currentMaze, agent->currentState, action);
         agent->environmentSteps++;
         agent->currentEpisodeSteps++;
         agent->currentEpisodeReturn += outcome.reward;
@@ -925,7 +931,7 @@ static void CollectGenRollout(
         } else {
             float nextObservation[GEN_LAYOUT_INPUT];
             float nextHidden[PPO_HIDDEN];
-            GenEncodeLayout(&agent->currentMaze, outcome.nextState, nextObservation);
+            EncodeLayout(&agent->currentMaze, outcome.nextState, nextObservation);
             step->nextValue = GenCriticForward(&agent->critic, nextObservation, nextHidden);
         }
 
@@ -947,6 +953,7 @@ static void TrainOnGenRollout(GenPpoAgent *agent, Rng *rng, PpoBatchStats *stats
 
     double entropySum = 0.0;
     double valueLossSum = 0.0;
+    double klSum = 0.0;
     long clippedCount = 0;
     long sampleCount = 0;
 
@@ -980,8 +987,10 @@ static void TrainOnGenRollout(GenPpoAgent *agent, Rng *rng, PpoBatchStats *stats
                 GenPpoStep *step = &agent->steps[order[index]];
                 float entropy = 0.0f;
                 bool wasClipped = false;
+                float kl = 0.0f;
                 AccumulateGenActorGradient(&agent->actor, step, step->advantage,
-                    &agent->config, scale, actorGradient, &entropy, &wasClipped);
+                    &agent->config, scale, actorGradient, &entropy, &wasClipped, &kl);
+                klSum += kl;
                 float valueLoss = 0.0f;
                 AccumulateGenCriticGradient(&agent->critic, step->observation,
                     step->target, scale, criticGradient, &valueLoss);
@@ -1012,6 +1021,7 @@ static void TrainOnGenRollout(GenPpoAgent *agent, Rng *rng, PpoBatchStats *stats
         stats->entropy = (float)(entropySum / (double)sampleCount);
         stats->valueLoss = (float)(valueLossSum / (double)sampleCount);
         stats->clipFraction = (float)((double)clippedCount / (double)sampleCount);
+        stats->approxKl = (float)(klSum / (double)sampleCount);
     }
 }
 
@@ -1020,24 +1030,238 @@ static void TrainOnGenRollout(GenPpoAgent *agent, Rng *rng, PpoBatchStats *stats
 static EpisodeResult EvaluateGenGreedy(const GenPpoAgent *agent, const ExperimentMaze *maze)
 {
     EpisodeResult result = {0};
-    GenMazeView view = GenViewOfMaze(maze);
+    GenMazeView view = ViewOfMaze(maze);
     int state = maze->startState;
     for (int step = 0; step < GEN_MAX_STEPS; step++) {
         float observation[GEN_LAYOUT_INPUT];
         float hidden[PPO_HIDDEN];
         float logits[ACTION_COUNT];
-        GenEncodeLayout(&view, state, observation);
+        EncodeLayout(&view, state, observation);
         GenActorForward(&agent->actor, observation, hidden, logits);
         int best = 0;
         for (int action = 1; action < ACTION_COUNT; action++)
             if (logits[action] > logits[best]) best = action;
-        GenStepOutcome outcome = GenStep(&view, state, (Action)best);
+        GenStepOutcome outcome = StepMaze(&view, state, (Action)best);
         result.totalReward += outcome.reward;
         result.steps = step + 1;
         state = outcome.nextState;
         if (outcome.done) { result.reachedGoal = true; break; }
     }
     return result;
+}
+
+
+/* ---------- saved policies ----------
+
+   Only the actor is saved: the critic exists to compute advantages during
+   training and has no role in acting. The on-disk layout is exactly
+   GenActorNetwork's, so loading is a straight read into that struct and
+   greedy action selection reuses GenActorForward -- the identical code path
+   training used, rather than a reimplementation that could drift. */
+
+#define PPO_POLICY_MAGIC 0x414F5050u   /* "PPOA" */
+#define PPO_POLICY_VERSION 1u
+
+struct PpoPolicy {
+    GenActorNetwork actor;
+};
+
+static bool SaveGenActor(const GenActorNetwork *actor, const char *path)
+{
+    FILE *file = fopen(path, "wb");
+    if (!file) return false;
+    uint32_t header[6] = {
+        PPO_POLICY_MAGIC,
+        PPO_POLICY_VERSION,
+        (uint32_t)GEN_LAYOUT_INPUT,
+        (uint32_t)PPO_HIDDEN,
+        (uint32_t)ACTION_COUNT,
+        (uint32_t)(sizeof(GenActorNetwork) / sizeof(float))
+    };
+    bool ok = fwrite(header, sizeof(header), 1, file) == 1 &&
+        fwrite(actor, sizeof(*actor), 1, file) == 1;
+    return (fclose(file) == 0) && ok;
+}
+
+PpoPolicy *PpoPolicyLoad(const char *path)
+{
+    FILE *file = fopen(path, "rb");
+    if (!file) return NULL;
+    uint32_t header[6];
+    if (fread(header, sizeof(header), 1, file) != 1) { fclose(file); return NULL; }
+    if (header[0] != PPO_POLICY_MAGIC || header[1] != PPO_POLICY_VERSION ||
+        header[2] != (uint32_t)GEN_LAYOUT_INPUT || header[3] != (uint32_t)PPO_HIDDEN ||
+        header[4] != (uint32_t)ACTION_COUNT ||
+        header[5] != (uint32_t)(sizeof(GenActorNetwork) / sizeof(float))) {
+        fclose(file);
+        return NULL;
+    }
+    PpoPolicy *policy = malloc(sizeof(PpoPolicy));
+    if (!policy) { fclose(file); return NULL; }
+    if (fread(&policy->actor, sizeof(policy->actor), 1, file) != 1) {
+        free(policy);
+        fclose(file);
+        return NULL;
+    }
+    fclose(file);
+    return policy;
+}
+
+void PpoPolicyDestroy(PpoPolicy *policy) { free(policy); }
+
+int PpoPolicyInputSize(const PpoPolicy *policy) { (void)policy; return GEN_LAYOUT_INPUT; }
+
+int PpoPolicyGreedyAction(const PpoPolicy *policy, const float *observation)
+{
+    float hidden[PPO_HIDDEN];
+    float logits[ACTION_COUNT];
+    GenActorForward(&policy->actor, observation, hidden, logits);
+    int best = 0;
+    for (int action = 1; action < ACTION_COUNT; action++)
+        if (logits[action] > logits[best]) best = action;
+    return best;
+}
+
+
+/* ---------- steppable trainer ----------
+
+   Same collect -> GAE -> epochs sequence the headless driver runs, exposed
+   one rollout at a time so the 3D view can interleave training with
+   rendering. A rollout is ~2,048 environment steps and takes about 0.18s,
+   so the window stays responsive while genuinely training. */
+
+struct PpoTrainer {
+    GenPpoAgent *agent;
+    ExperimentMaze *mazes;
+    Rng rng;
+    bool randomGoals;
+    int minSeparation;
+    PpoTrainerMetrics metrics;
+};
+
+PpoTrainer *PpoTrainerCreate(uint64_t seed, bool randomGoals, int minSeparation)
+{
+    PpoTrainer *trainer = calloc(1, sizeof(PpoTrainer));
+    if (!trainer) return NULL;
+    trainer->agent = malloc(sizeof(GenPpoAgent));
+    trainer->mazes = malloc(sizeof(ExperimentMaze) * GEN_MAZE_COUNT);
+    if (!trainer->agent || !trainer->mazes) {
+        PpoTrainerDestroy(trainer);
+        return NULL;
+    }
+    BuildMazeSuite(trainer->mazes, GEN_SUITE_SEED);
+    trainer->randomGoals = randomGoals;
+    trainer->minSeparation = minSeparation;
+
+    RngSeed(&trainer->rng, seed ^ UINT64_C(0x5050474e));
+    memset(trainer->agent, 0, sizeof(GenPpoAgent));
+    trainer->agent->config = DefaultPpoConfig();
+    InitializeGenActor(&trainer->agent->actor, &trainer->rng);
+    InitializeGenCritic(&trainer->agent->critic, &trainer->rng);
+    StartGenEpisode(trainer->agent, trainer->mazes, randomGoals, minSeparation,
+        &trainer->rng);
+    return trainer;
+}
+
+void PpoTrainerDestroy(PpoTrainer *trainer)
+{
+    if (!trainer) return;
+    free(trainer->agent);
+    free(trainer->mazes);
+    free(trainer);
+}
+
+void PpoTrainerStep(PpoTrainer *trainer)
+{
+    GenPpoAgent *agent = trainer->agent;
+    CollectGenRollout(agent, trainer->mazes, trainer->randomGoals,
+        trainer->minSeparation, &trainer->rng);
+    ComputeGenAdvantages(agent->steps, agent->stepCount, &agent->config);
+    NormalizeGenAdvantages(agent->steps, agent->stepCount);
+    PpoBatchStats batch = {0};
+    TrainOnGenRollout(agent, &trainer->rng, &batch);
+
+    trainer->metrics.environmentSteps = agent->environmentSteps;
+    trainer->metrics.updates = agent->actorUpdates;
+    trainer->metrics.episodes = agent->completedEpisodes;
+    trainer->metrics.goals = agent->completedGoals;
+    trainer->metrics.trainReturn = agent->completedEpisodes > 0
+        ? agent->completedReturnSum / (float)agent->completedEpisodes
+        : 0.0f;
+    trainer->metrics.entropy = batch.entropy;
+    trainer->metrics.valueLoss = batch.valueLoss;
+    trainer->metrics.clipFraction = batch.clipFraction;
+    trainer->metrics.approxKl = batch.approxKl;
+}
+
+PpoTrainerMetrics PpoTrainerLastMetrics(const PpoTrainer *trainer)
+{
+    return trainer->metrics;
+}
+
+int PpoTrainerGreedyRoute(
+    const PpoTrainer *trainer,
+    int mazeIndex,
+    int *route,
+    int capacity,
+    bool *reachedGoal)
+{
+    const ExperimentMaze *maze = &trainer->mazes[mazeIndex];
+    GenMazeView view = ViewOfMaze(maze);
+    float observation[GEN_LAYOUT_INPUT];
+    float hidden[PPO_HIDDEN];
+    float logits[ACTION_COUNT];
+    int state = maze->startState;
+    int count = 0;
+    if (capacity > 0) route[count++] = state;
+    *reachedGoal = false;
+    for (int step = 0; step < GEN_MAX_STEPS && count < capacity; step++) {
+        EncodeLayout(&view, state, observation);
+        GenActorForward(&trainer->agent->actor, observation, hidden, logits);
+        int best = 0;
+        for (int a = 1; a < ACTION_COUNT; a++) if (logits[a] > logits[best]) best = a;
+        GenStepOutcome outcome = StepMaze(&view, state, (Action)best);
+        state = outcome.nextState;
+        route[count++] = state;
+        if (outcome.done) { *reachedGoal = true; break; }
+    }
+    return count;
+}
+
+/* Detects a two-cell oscillation in the tail of a greedy rollout. */
+static bool TailIsTwoCycle(const int *route, int count)
+{
+    if (count < 8) return false;
+    int a = route[count - 1], b = route[count - 2];
+    if (a == b) return false;                 /* stuck on one cell, not a cycle */
+    int window = count < 20 ? count : 20;
+    for (int k = 0; k < window; k++) {
+        int state = route[count - 1 - k];
+        if (state != a && state != b) return false;
+    }
+    return true;
+}
+
+PpoEvalSummary PpoTrainerEvaluate(const PpoTrainer *trainer, int firstMaze, int count)
+{
+    PpoEvalSummary summary = {0};
+    if (count <= 0) return summary;
+    double total = 0.0;
+    int route[GEN_MAX_STEPS + 2];
+    for (int i = 0; i < count; i++) {
+        int index = firstMaze + i;
+        if (index < 0 || index >= GEN_MAZE_COUNT) continue;
+        summary.total++;
+        bool solved = false;
+        int length = PpoTrainerGreedyRoute(trainer, index, route,
+            GEN_MAX_STEPS + 2, &solved);
+        EpisodeResult result = EvaluateGenGreedy(trainer->agent, &trainer->mazes[index]);
+        total += result.totalReward;
+        if (solved) summary.solved++;
+        else if (TailIsTwoCycle(route, length)) summary.livelocked++;
+    }
+    summary.meanReturn = (float)(total / (double)(summary.total ? summary.total : 1));
+    return summary;
 }
 
 /* ---------- experiment driver ---------- */
@@ -1051,6 +1275,7 @@ typedef struct {
     bool generalize;
     bool randomGoals;
     int minSeparation;
+    const char *savePolicyPath;
     /* Hyperparameters, overridable from the command line so PPO's components
        can be swept and ablated without recompiling. */
     PpoConfig config;
@@ -1058,7 +1283,7 @@ typedef struct {
 
 static PpoOptions DefaultPpoOptions(void)
 {
-    PpoOptions options = {200000, 5, 1, "ppo.csv", false, false, false, 0,
+    PpoOptions options = {200000, 5, 1, "ppo.csv", false, false, false, 0, NULL,
         DefaultPpoConfig()};
     return options;
 }
@@ -1124,6 +1349,8 @@ static bool ParsePpoOptions(int argc, char **argv, PpoOptions *options)
             options->csvPath = argv[++index];
         } else if (strcmp(argv[index], "--compare-dqn") == 0) {
             options->compareDqn = true;
+        } else if (strcmp(argv[index], "--save-policy") == 0 && index + 1 < argc) {
+            options->savePolicyPath = argv[++index];
         } else if (strcmp(argv[index], "--generalize") == 0) {
             options->generalize = true;
         } else if (strcmp(argv[index], "--random-goals") == 0) {
@@ -1159,6 +1386,9 @@ static bool ParsePpoOptions(int argc, char **argv, PpoOptions *options)
         return false;
     if (options->minSeparation > 0 && !options->randomGoals) return false;
     if (options->compareDqn && options->generalize) return false;
+    /* Saving a policy only means anything for the multi-maze actor the 3D
+       view replays. */
+    if (options->savePolicyPath && !options->generalize) return false;
     return true;
 }
 
@@ -1333,9 +1563,18 @@ static int RunGenPpoSeed(
         CollectGenRollout(agent, mazes, options->randomGoals, options->minSeparation, &rng);
         ComputeGenAdvantages(agent->steps, agent->stepCount, &agent->config);
         NormalizeGenAdvantages(agent->steps, agent->stepCount);
-        TrainOnGenRollout(agent, &rng, NULL);
+        PpoBatchStats batch = {0};
+        TrainOnGenRollout(agent, &rng, &batch);
     }
     double elapsed = 1000.0 * (double)(clock() - start) / CLOCKS_PER_SEC;
+
+    if (options->savePolicyPath && seed == options->firstSeed) {
+        if (SaveGenActor(&agent->actor, options->savePolicyPath))
+            printf("Saved policy (seed %llu) to %s\n",
+                (unsigned long long)seed, options->savePolicyPath);
+        else
+            fprintf(stderr, "Could not write policy to %s\n", options->savePolicyPath);
+    }
 
     int groupSuccess[4] = {0};
     int groupTotal[4] = {0};
@@ -1381,7 +1620,7 @@ static int RunGenPpoExperiment(const PpoOptions *options)
 {
     ExperimentMaze *mazes = malloc(sizeof(ExperimentMaze) * GEN_MAZE_COUNT);
     if (!mazes) return 1;
-    GenBuildMazeSuite(mazes, GEN_SUITE_SEED);
+    BuildMazeSuite(mazes, GEN_SUITE_SEED);
 
     FILE *csv = fopen(options->csvPath, "w");
     if (!csv) {
@@ -1409,7 +1648,8 @@ int RunPpoExperiment(int argc, char **argv)
     PpoOptions options;
     if (!ParsePpoOptions(argc, argv, &options)) {
         fprintf(stderr, "Usage: %s --ppo [--steps N] [--seeds N] [--seed N] [--csv FILE] "
-            "[--compare-dqn | --generalize [--random-goals [--min-separation N]]]\n", argv[0]);
+            "[--compare-dqn | --generalize [--random-goals [--min-separation N]] "
+            "[--save-policy FILE]]\n", argv[0]);
         return 2;
     }
     if (options.generalize) return RunGenPpoExperiment(&options);
@@ -1681,13 +1921,13 @@ static bool GenGradientSelfTest(void)
     if (!mazes || !actor || !actorGradient || !critic || !criticGradient || !step)
         goto cleanup;
 
-    GenBuildMazeSuite(mazes, GEN_SUITE_SEED);
+    BuildMazeSuite(mazes, GEN_SUITE_SEED);
     InitializeGenActor(actor, &rng);
     InitializeGenCritic(critic, &rng);
 
     memset(step, 0, sizeof(*step));
-    GenMazeView view = GenViewOfMaze(&mazes[0]);
-    GenEncodeLayout(&view, mazes[0].startState, step->observation);
+    GenMazeView view = ViewOfMaze(&mazes[0]);
+    EncodeLayout(&view, mazes[0].startState, step->observation);
     step->action = ACTION_RIGHT;
 
     /* Start the ratio at exactly 1, inside the clip range, where the
@@ -1706,7 +1946,7 @@ static bool GenGradientSelfTest(void)
 
     memset(actorGradient, 0, sizeof(*actorGradient));
     AccumulateGenActorGradient(actor, step, advantage, &config, 1.0f, actorGradient,
-        NULL, NULL);
+        NULL, NULL, NULL);
     /* Probe an input weight on a channel the observation actually activates,
        plus an output weight, covering both backprop stages. */
     int activeInput = -1;

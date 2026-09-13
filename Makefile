@@ -20,7 +20,7 @@ CPPFLAGS := -I$(RAYLIB_INCLUDE) -Isrc
 
 SOURCES := $(wildcard src/*.c)
 LIB_SOURCES := $(filter-out src/main.c src/benchmark.c,$(SOURCES))
-.PHONY: all benchmark generalization generalization-procedural generalization-random-goals generalization-random-goals-sep10 generalization-wide-conv generalization-sep-sweep ppo ppo-generalization video test clean
+.PHONY: all render3d render3d-policy train3d ppo-demo-video policy benchmark generalization generalization-procedural generalization-random-goals generalization-random-goals-sep10 generalization-wide-conv generalization-sep-sweep ppo ppo-generalization video test clean
 
 all: $(TARGET)
 
@@ -67,6 +67,25 @@ ppo: $(TARGET)
 ppo-generalization: $(TARGET)
 	./$(TARGET) --ppo --generalize --random-goals --min-separation 10 \
 		--steps 575000 --seeds 10 --seed 1 --csv ppo_generalization_sep10.csv
+
+render3d: $(TARGET)
+	./$(TARGET) --render3d --maze 0
+
+# Train a policy for the 3D view to replay, then watch it
+policy: $(TARGET)
+	@mkdir -p policies
+	./$(TARGET) --ppo --generalize --random-goals --min-separation 10 \
+		--steps 575000 --seeds 1 --seed 1 \
+		--save-policy policies/ppo_sep10_seed1.bin --csv ppo_policy_run.csv
+
+train3d: $(TARGET)
+	./$(TARGET) --render3d --train --maze 16
+
+render3d-policy: $(TARGET)
+	./$(TARGET) --render3d --maze 16 --policy policies/ppo_sep10_seed1.bin
+
+ppo-demo-video: $(TARGET)
+	./scripts/render_ppo_demo.sh assets/ppo_generalization.mp4
 
 video: $(TARGET)
 	./scripts/render_generalization_video.sh assets/conv_learning.mp4
